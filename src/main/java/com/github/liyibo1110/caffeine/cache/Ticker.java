@@ -11,13 +11,11 @@ public interface Ticker {
 
     /**
      * 获取时间点
-     * @return
      */
     long read();
 
     /**
      * 获取SystemTicker单例
-     * @return
      */
     static @NonNull Ticker systemTicker() {
         return SystemTicker.INSTANCE;
@@ -25,7 +23,6 @@ public interface Ticker {
 
     /**
      * 获取DisabledTicker单例
-     * @return
      */
     static @NonNull Ticker disabledTicker() {
         return DisabledTicker.INSTANCE;
