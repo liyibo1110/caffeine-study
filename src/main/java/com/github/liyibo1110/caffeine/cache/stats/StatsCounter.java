@@ -63,13 +63,14 @@ public interface StatsCounter {
      * 返回DisabledStatsCounter计数器的实例
      */
     static @NonNull StatsCounter disabledStatsCounter() {
-
+        return DisabledStatsCounter.INSTANCE;
     }
 
     /**
-     * 返回GuardedStatsCounter计数器的实例
+     * 返回GuardedStatsCounter计数器的实例，其它类型就直接封装成GuardedStatsCounter并返回
      */
     static @NonNull StatsCounter guardedStatsCounter(@NonNull StatsCounter statsCounter) {
-
+        return (statsCounter instanceof GuardedStatsCounter)
+                ? statsCounter : new GuardedStatsCounter(statsCounter);
     }
 }

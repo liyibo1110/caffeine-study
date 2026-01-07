@@ -1,0 +1,92 @@
+package com.github.liyibo1110.caffeine.cache;
+
+import com.github.liyibo1110.caffeine.cache.stats.CacheStats;
+import com.google.errorprone.annotations.CompatibleWith;
+import org.checkerframework.checker.index.qual.NonNegative;
+import org.checkerframework.checker.nullness.qual.NonNull;
+import org.checkerframework.checker.nullness.qual.Nullable;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Function;
+
+/**
+ * 最基础的CacheAPI接口
+ * 此接口实现需要线程安全
+ * @author liyibo
+ * @date 2026-01-06 16:14
+ */
+public interface Cache<K, V> {
+
+    /**
+     * 根据key返回对应的value，不存在则返回null
+     */
+    @Nullable
+    V getIfPresent(@NonNull @CompatibleWith("K") Object key);
+
+    /**
+     * 根据key返回对应的value，不存在则调用function来生成value，并放入cache
+     * function应简单且不要更新cache的其它条目
+     */
+    @Nullable
+    V get(@NonNull K key, @NonNull Function<? super K, ? extends V> function);
+
+    /**
+     * 根据keys返回key和value，value不存在则不会加到map中
+     */
+    @NonNull
+    Map<@NonNull K, @NonNull V> getAllPresent(@NonNull Iterable<@NonNull ?> keys);
+
+    @NonNull
+    default Map<K, V> getAll(@NonNull Iterable<? extends @NonNull K> keys,
+                             @NonNull Function<Iterable<? extends @NonNull K>, @NonNull Map<K, V>> function) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 如key存在，则用新value替换旧值
+     */
+    void put(@NonNull K key, @NonNull V value);
+
+    void putAll(@NonNull Map<? extends @NonNull K, ? extends @NonNull V> map);
+
+    /**
+     * 丢弃key对应的value
+     */
+    void invalidate(@NonNull @CompatibleWith("K") Object key);
+
+    void invalidateAll(@NonNull Iterable<@NonNull ?> keys);
+
+    void invalidateAll();
+
+    /**
+     * 返回cache中近似的条目数
+     */
+    @NonNegative
+    long estimatedSize();
+
+    /**
+     * 返回cache的快照，所有统计信息初始化为0
+     * 维护统计信息会带来性能损失，一些实现可能不会立即记录，或者根本不记录
+     */
+    @NonNull
+    CacheStats stats();
+
+    /**
+     * 将cache以线程安全形式返回，对映射所作的修改会直接影响cache
+     */
+    @NonNull
+    ConcurrentMap<@NonNull K, @NonNull V> asMap();
+
+    /**
+     * 执行cache所需的任何待处理的维护操作
+     * 具体执行内容，由实现类自行决定
+     */
+    void cleanUp();
+
+    /**
+     * 返回对应的策略实例
+     */
+    @NonNull
+    Policy<K, V> policy();
+}
