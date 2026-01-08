@@ -1,8 +1,5 @@
 package com.github.liyibo1110.caffeine.cache;
 
-import org.checkerframework.checker.nullness.qual.NonNull;
-import org.checkerframework.checker.nullness.qual.Nullable;
-
 import java.util.Objects;
 import java.util.logging.Logger;
 
@@ -14,7 +11,7 @@ import java.util.logging.Logger;
 public final class Caffeine<K, V> {
     static final Logger logger = Logger.getLogger(Caffeine.class.getName());
 
-    @Nullable Ticker ticker;
+    Ticker ticker;
 
     private Caffeine() {}
 
@@ -33,7 +30,7 @@ public final class Caffeine<K, V> {
      * @param template
      * @param args
      */
-    static void requireArgument(boolean expression, String template, @Nullable Object... args) {
+    static void requireArgument(boolean expression, String template, Object... args) {
         if(!expression)
             throw new IllegalArgumentException(String.format(template, args));
     }
@@ -53,7 +50,7 @@ public final class Caffeine<K, V> {
      * @param template
      * @param args
      */
-    static void requireState(boolean expression, String template, @Nullable Object... args) {
+    static void requireState(boolean expression, String template, Object... args) {
         if(!expression)
             throw new IllegalStateException(String.format(template, args));
     }
@@ -85,7 +82,7 @@ public final class Caffeine<K, V> {
      * @param ticker
      * @return
      */
-    public Caffeine<K, V> ticker(@NonNull Ticker ticker) {
+    public Caffeine<K, V> ticker(Ticker ticker) {
         // 限制了只能被设置1次
         requireState(this.ticker == null, "Ticker was already set to %s", this.ticker);
         this.ticker = Objects.requireNonNull(ticker);

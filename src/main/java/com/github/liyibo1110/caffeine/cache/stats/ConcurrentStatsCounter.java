@@ -1,7 +1,6 @@
 package com.github.liyibo1110.caffeine.cache.stats;
 
 import com.github.liyibo1110.caffeine.cache.RemovalCause;
-import org.checkerframework.checker.nullness.qual.NonNull;
 
 import java.util.concurrent.atomic.LongAdder;
 
@@ -82,9 +81,8 @@ public class ConcurrentStatsCounter implements StatsCounter {
 
     /**
      * 将指定的StatsCounter里面的记录值累加进来
-     * @param other
      */
-    public void incrementBy(@NonNull StatsCounter other) {
+    public void incrementBy(StatsCounter other) {
         CacheStats snapshot = other.snapshot();
         this.hitCount.add(snapshot.hitCount());
         this.missCount.add(snapshot.missCount());

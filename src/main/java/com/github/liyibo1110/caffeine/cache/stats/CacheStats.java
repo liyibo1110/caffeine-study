@@ -66,60 +66,49 @@ public final class CacheStats {
                 totalLoadTime, evictionCount, evictionWeight);
     }
 
-    @NonNull
     public static CacheStats empty() {
         return EMPTY_STATS;
     }
 
-    @NonNegative
     public long requestCount() {
         return this.saturatedAdd(this.hitCount, this.missCount);
     }
 
-    @NonNegative
     public long hitCount() {
         return hitCount;
     }
 
-    @NonNegative
     public double hitRate() {
         long requestCount = this.requestCount();
         return (requestCount == 0) ? 1.0D : (double)this.hitCount / requestCount;
     }
 
-    @NonNegative
     public long missCount() {
         return missCount;
     }
 
-    @NonNegative
     public double missRate() {
         long requestCount = this.requestCount();
         return (requestCount == 0) ? 1.0D : (double)this.missCount / requestCount;
     }
 
-    @NonNegative
     public long loadCount() {
         return this.saturatedAdd(this.loadSuccessCount, this.loadFailureCount);
     }
 
-    @NonNegative
     public long loadSuccessCount() {
         return this.loadSuccessCount;
     }
 
-    @NonNegative
     public long loadFailureCount() {
         return this.loadFailureCount;
     }
 
-    @NonNegative
     public double loadFailureRate() {
         long totalLoadCount = this.saturatedAdd(this.loadSuccessCount, this.loadFailureCount);
         return (totalLoadCount == 0) ? 0.0D : (double)this.loadFailureCount / totalLoadCount;
     }
 
-    @NonNegative
     public long totalLoadTime() {
         return this.totalLoadTime;
     }
@@ -127,18 +116,15 @@ public final class CacheStats {
     /**
      * 返回平均load时长
      */
-    @NonNegative
     public double averageLoadPenalty() {
         long totalLoadCount = this.saturatedAdd(this.loadSuccessCount, this.loadFailureCount);
         return (totalLoadCount == 0) ? 0.0D : (double)this.totalLoadTime / totalLoadCount;
     }
 
-    @NonNegative
     public long evictionCount() {
         return this.evictionCount;
     }
 
-    @NonNegative
     public long evictionWeight() {
         return this.evictionWeight;
     }
@@ -154,7 +140,7 @@ public final class CacheStats {
             this.saturatedAdd(evictionWeight, other.evictionWeight));
     }
 
-    public CacheStats minus(@NonNull CacheStats other) {
+    public CacheStats minus(CacheStats other) {
         return CacheStats.of(
             Math.max(0L, this.saturatedSubtract(hitCount, other.hitCount)),
             Math.max(0L, this.saturatedSubtract(missCount, other.missCount)),

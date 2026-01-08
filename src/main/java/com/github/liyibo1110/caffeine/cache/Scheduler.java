@@ -1,9 +1,5 @@
 package com.github.liyibo1110.caffeine.cache;
 
-import org.checkerframework.checker.index.qual.Positive;
-import org.checkerframework.checker.nullness.qual.NonNull;
-import org.checkerframework.checker.nullness.qual.Nullable;
-
 import java.io.Serializable;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -29,22 +25,21 @@ public interface Scheduler {
     /**
      * 返回一个Future实例，调度器将在指定延迟后将command提交给指定的executor
      */
-    @NonNull Future<?> schedule(@NonNull Executor executor, @NonNull Runnable command,
-                                @Positive long delay, @NonNull TimeUnit unit);
+    Future<?> schedule(Executor executor, Runnable command, long delay, TimeUnit unit);
 
-    static @NonNull Scheduler disabledScheduler() {
+    static Scheduler disabledScheduler() {
         return DisabledScheduler.INSTANCE;
     }
 
-    static @NonNull Scheduler systemScheduler() {
+    static Scheduler systemScheduler() {
         return SystemScheduler.isPresent() ? SystemScheduler.INSTANCE : disabledScheduler();
     }
 
-    static @NonNull Scheduler forScheduledExecutorService(@NonNull ScheduledExecutorService service) {
+    static Scheduler forScheduledExecutorService(ScheduledExecutorService service) {
         return new ExecutorServiceScheduler(service);
     }
 
-    static @NonNull Scheduler guardedScheduler(@NonNull Scheduler scheduler) {
+    static Scheduler guardedScheduler(Scheduler scheduler) {
         return (scheduler instanceof GuardedScheduler) ? scheduler : new GuardedScheduler(scheduler);
     }
 }
@@ -56,7 +51,7 @@ public interface Scheduler {
 enum SystemScheduler implements Scheduler {
     INSTANCE;
 
-    static final @Nullable Method delayedExecutor = getDelayedExecutorMethod();
+    static final Method delayedExecutor = getDelayedExecutorMethod();
 
     @Override
     public Future<?> schedule(Executor executor, Runnable command,
@@ -77,7 +72,7 @@ enum SystemScheduler implements Scheduler {
     /**
      * 尝试获取CompletableFuture类的delayedExecutor方法实例（Java9才会有，此项目最低版本是Java8）
      */
-    static @Nullable Method getDelayedExecutorMethod() {
+    static Method getDelayedExecutorMethod() {
         try {
             return CompletableFuture.class.getMethod("delayedExecutor", long.class, TimeUnit.class, Executor.class);
         } catch (NoSuchMethodException | SecurityException e) {

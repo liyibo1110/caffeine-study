@@ -1,7 +1,5 @@
 package com.github.liyibo1110.caffeine.cache;
 
-import org.checkerframework.checker.nullness.qual.Nullable;
-
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
@@ -23,7 +21,7 @@ final class Pacer {
     long nextFireTime;
 
     /** 要重点理解的字段，意味着任意时刻，只允许存在1个已调度任务 */
-    @Nullable Future<?> future;
+    Future<?> future;
 
     Pacer(Scheduler scheduler) {
         this.scheduler = Objects.requireNonNull(scheduler);

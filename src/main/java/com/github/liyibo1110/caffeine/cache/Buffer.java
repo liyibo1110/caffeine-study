@@ -1,7 +1,5 @@
 package com.github.liyibo1110.caffeine.cache;
 
-import org.checkerframework.checker.nullness.qual.NonNull;
-
 import java.util.function.Consumer;
 
 /**
@@ -19,13 +17,13 @@ interface Buffer<E> {
     /**
      * 放置新元素
      */
-    int offer(@NonNull E e);
+    int offer(E e);
 
     /**
      * 清空Buffer，并传入指定的Consumer来处理
      * @param consumer
      */
-    void drainTo(@NonNull Consumer<E> consumer);
+    void drainTo(Consumer<E> consumer);
 
     /**
      * 返回从Buffer中读取走的元素个数

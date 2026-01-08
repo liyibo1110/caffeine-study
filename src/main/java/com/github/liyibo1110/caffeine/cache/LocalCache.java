@@ -1,8 +1,6 @@
 package com.github.liyibo1110.caffeine.cache;
 
 import com.github.liyibo1110.caffeine.cache.stats.StatsCounter;
-import org.checkerframework.checker.nullness.qual.NonNull;
-import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
@@ -19,7 +17,7 @@ import java.util.function.Function;
 interface LocalCache<K, V> extends ConcurrentMap<K, V> {
     boolean isRecordingStats();
 
-    @NonNull StatsCounter statsCounter();
+    StatsCounter statsCounter();
 
     boolean hasRemovalListener();
 
@@ -28,12 +26,12 @@ interface LocalCache<K, V> extends ConcurrentMap<K, V> {
     /**
      * 异步地发送通知给对应的RemovalListener实例
      */
-    void notifyRemoval(@Nullable K key, @Nullable V value, RemovalCause cause);
+    void notifyRemoval(K key, V value, RemovalCause cause);
 
     /**
      * 返回cache对应的Executor
      */
-    @NonNull Executor executor();
+    Executor executor();
 
     /**
      * cache是否要捕获条目的写入时间
@@ -43,32 +41,32 @@ interface LocalCache<K, V> extends ConcurrentMap<K, V> {
     /**
      * 返回cache对应判断过期的Ticker实例
      */
-    @NonNull Ticker expirationTicker();
+    Ticker expirationTicker();
 
     /**
      * 返回cache对应统计操作的Ticker实例
      */
-    @NonNull Ticker statsTicker();
+    Ticker statsTicker();
 
     long estimatedSize();
 
-    @Nullable V getIfPresent(@NonNull Object key, boolean recordStats);
+    V getIfPresent(Object key, boolean recordStats);
 
     /**
      * 和Cache接口实现的不同之处在于，不会统计信息记录访问，也不使用淘汰策略，而是填充已知的写入时间
      */
-    @Nullable V getIfPresentQuietly(@NonNull Object key, long[] writeTime);
+    V getIfPresentQuietly(Object key, long[] writeTime);
 
-    @NonNull Map<K, V> getAllPresent(@NonNull Iterable<?> keys);
+    Map<K, V> getAllPresent(Iterable<?> keys);
 
     /**
      * 和Cache接口实现的不同之处在于，允许在插入或更新条目时，不通知写入者
      */
-    @Nullable V put(@NonNull K key, @NonNull V value, boolean notifyWriter);
+    V put(K key, V value, boolean notifyWriter);
 
     @Override
-    default @Nullable V compute(K key,
-        BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+    default V compute(K key,
+                      BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
         return this.compute(key, remappingFunction, false, true, true);
     }
 
@@ -76,16 +74,16 @@ interface LocalCache<K, V> extends ConcurrentMap<K, V> {
      * 和ConcurrentMap的compute不同之处在于：
      * 接收额外的参数，指示是否根据操作的成功与否来记录未命中和加载统计信息
      */
-    @Nullable V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction,
-                         boolean recordMiss, boolean recordLoad, boolean recordLoadFailure);
+    V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction,
+              boolean recordMiss, boolean recordLoad, boolean recordLoadFailure);
 
 
     /**
      * 和ConcurrentMap的computeIfAbsent不同之处在于：
      * 接收额外的参数，指示如何记录统计信息
      */
-    @Nullable V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
-                                boolean recordStats, boolean recordLoad);
+    V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
+                      boolean recordStats, boolean recordLoad);
 
     default void invalidateAll(Iterable<?> keys) {
         for(Object key : keys)

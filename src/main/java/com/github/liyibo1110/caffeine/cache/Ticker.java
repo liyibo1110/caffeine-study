@@ -1,7 +1,5 @@
 package com.github.liyibo1110.caffeine.cache;
 
-import org.checkerframework.checker.nullness.qual.NonNull;
-
 /**
  * 返回一个特定的时间值，单位是纳秒（默认有2种实现）
  * @author liyibo
@@ -17,14 +15,14 @@ public interface Ticker {
     /**
      * 获取SystemTicker单例
      */
-    static @NonNull Ticker systemTicker() {
+    static Ticker systemTicker() {
         return SystemTicker.INSTANCE;
     }
 
     /**
      * 获取DisabledTicker单例
      */
-    static @NonNull Ticker disabledTicker() {
+    static Ticker disabledTicker() {
         return DisabledTicker.INSTANCE;
     }
 }
