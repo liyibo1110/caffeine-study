@@ -34,7 +34,7 @@ final class Async {
     }
 
     /**
-     * 直接取值，如完成则返回值，未完成或错误则返回null
+     * 尝试取值，如完成则返回值，未完成或错误则返回null
      */
     static <V> V getWhenSuccessful(CompletableFuture<V> future) {
         try {

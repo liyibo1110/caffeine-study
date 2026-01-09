@@ -12,7 +12,7 @@ enum DisabledStatsCounter implements StatsCounter {
     public void recordHits(int count) {}
 
     @Override
-    public void recordMissed(int count) {}
+    public void recordMisses(int count) {}
 
     @Override
     public void recordLoadSuccess(long loadTime) {}

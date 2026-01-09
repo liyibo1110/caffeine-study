@@ -30,9 +30,9 @@ final class GuardedStatsCounter implements StatsCounter {
     }
 
     @Override
-    public void recordMissed(int count) {
+    public void recordMisses(int count) {
         try {
-            this.delegate.recordMissed(count);
+            this.delegate.recordMisses(count);
         } catch (Throwable t) {
             this.logger.log(Level.WARNING, "Exception thrown by stats counter", t);
         }

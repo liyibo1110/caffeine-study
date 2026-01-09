@@ -1,18 +1,27 @@
 package com.github.liyibo1110.caffeine.cache;
 
+import com.github.liyibo1110.caffeine.cache.stats.CacheStats;
+import org.checkerframework.checker.nullness.qual.Nullable;
+
 import java.io.Serializable;
+import java.util.AbstractCollection;
 import java.util.AbstractMap;
+import java.util.AbstractSet;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -21,8 +30,6 @@ import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-
-import static java.util.Objects.requireNonNull;
 
 /**
  * @author liyibo
@@ -91,7 +98,7 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
             }
             futures.put(key, future);
         }
-        this.cache().statsCounter().recordMissed(proxies.size());
+        this.cache().statsCounter().recordMisses(proxies.size());
         this.cache().statsCounter().recordHits(futures.size() - proxies.size());
         if(proxies.isEmpty()) // 全部命中则收尾
             this.composeResult(futures);
@@ -144,12 +151,12 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
                 this.cache().remove(key, valueFuture);
                 this.cache().statsCounter().recordLoadFailure(loadTime);
                 if(recordMiss)
-                    this.cache().statsCounter().recordMissed(1);
+                    this.cache().statsCounter().recordMisses(1);
             }else {
                 this.cache().replace(key, valueFuture, valueFuture);    // 没有被其它线程换成别的value才替换
                 this.cache().statsCounter().recordLoadSuccess(loadTime);
                 if(recordMiss)
-                    this.cache().statsCounter().recordMissed(1);
+                    this.cache().statsCounter().recordMisses(1);
             }
         });
     }
@@ -282,6 +289,10 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
             return prior;
         }
 
+        public void putAll(Map<? extends K, ? extends CompletableFuture<V>> map) {
+            map.forEach(this::put);
+        }
+
         @Override
         public CompletableFuture<V> replace(K key, CompletableFuture<V> value) {
             CompletableFuture<V> prior = this.asyncCache.cache().replace(key, value);
@@ -409,8 +420,8 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
         }
     }
 
-    /** 以下均为同步视图相关 */
-    /*final class CacheView<K, V> extends AbstractCacheView<K, V> {
+    /** 以下与同步视图相关 */
+    final class CacheView<K, V> extends AbstractCacheView<K, V> {
         private static final long serialVersionUID = 1L;
 
         final LocalAsyncCache<K, V> asyncCache;
@@ -425,9 +436,122 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
         }
     }
 
+    /**
+     * 同步视图通用模板方法
+     */
     abstract class AbstractCacheView<K, V> implements Cache<K, V>, Serializable {
+        transient AsMapView<K, V> asMapView;
+
         abstract LocalAsyncCache<K, V> asyncCache();
-    }*/
+
+        @Override
+        public @Nullable V getIfPresent(Object key) {
+            // 注意这个方法是不阻塞的，没有算好的value就是返回null
+            CompletableFuture<V> future = this.asyncCache().cache().getIfPresent(key, true);
+            return Async.getIfReady(future);
+        }
+
+        @Override
+        public Map<K, V> getAllPresent(Iterable<?> keys) {
+            // key去重
+            Set<Object> uniqueKeys = new LinkedHashSet<>();
+            for(Object key : keys)
+                uniqueKeys.add(key);
+
+            int misses = 0;
+            Map<Object, Object> result = new LinkedHashMap<>();
+            for(Object key : uniqueKeys) {
+                CompletableFuture<V> future = this.asyncCache().cache().get(key);
+                Object value = Async.getIfReady(future);
+                if(value == null)
+                    misses++;
+                else
+                    result.put(key, value);
+            }
+            this.asyncCache().cache().statsCounter().recordMisses(misses);
+            this.asyncCache().cache().statsCounter().recordHits(result.size());
+            Map<K, V> castedResult = (Map<K, V>)result;
+            return Collections.unmodifiableMap(castedResult);
+        }
+
+        @Override
+        public V get(K key, Function<? super K, ? extends V> mappingFunction) {
+            return resolve(this.asyncCache().get(key, mappingFunction));
+        }
+
+        @Override
+        public Map<K, V> getAll(Iterable<? extends K> keys, Function<Iterable<? extends K>, Map<K, V>> mappingFunction) {
+            return resolve(this.asyncCache().getAll(keys, mappingFunction));
+        }
+
+        protected static <T> T resolve(CompletableFuture<T> future) throws Error {
+            try {
+                return future.get();
+            } catch (ExecutionException e) {
+                if (e.getCause() instanceof AsyncBulkCompleter.NullMapCompletionException) {
+                    throw new NullPointerException(e.getCause().getMessage());
+                } else if (e.getCause() instanceof RuntimeException) {
+                    throw (RuntimeException) e.getCause();
+                } else if (e.getCause() instanceof Error) {
+                    throw (Error)e.getCause();
+                }
+                throw new CompletionException(e.getCause());
+            } catch (InterruptedException e) {
+                throw new CompletionException(e);
+            }
+        }
+
+        @Override
+        public void put(K key, V value) {
+            Objects.requireNonNull(value);
+            this.asyncCache().cache().put(key, CompletableFuture.completedFuture(value));
+        }
+
+        @Override
+        public void putAll(Map<? extends K, ? extends V> map) {
+            map.forEach(this::put);
+        }
+
+        @Override
+        public void invalidate(Object key) {
+            this.asyncCache().cache().remove(key);
+        }
+
+        @Override
+        public void invalidateAll(Iterable<?> keys) {
+            this.asyncCache().cache().invalidateAll(keys);
+        }
+
+        @Override
+        public void invalidateAll() {
+            this.asyncCache().cache().clear();
+        }
+
+        @Override
+        public long estimatedSize() {
+            return this.asyncCache().cache().estimatedSize();
+        }
+
+        @Override
+        public CacheStats stats() {
+            return this.asyncCache().cache().statsCounter().snapshot();
+        }
+
+        @Override
+        public void cleanUp() {
+            this.asyncCache().cache().cleanUp();
+        }
+
+        @Override
+        public Policy<K, V> policy() {
+            return this.asyncCache().policy();
+        }
+
+        @Override
+        public ConcurrentMap<K, V> asMap() {
+            return this.asMapView == null ? asMapView = new AsMapView<>(this.asyncCache().cache()) : this.asMapView;
+        }
+    }
 
     final class AsMapView<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
         final LocalCache<K, CompletableFuture<V>> delegate;
@@ -470,18 +594,423 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
         }
 
         @Override
-        public Set<Entry<K, V>> entrySet() {
-            return null;
+        public V get(Object key) {
+            return Async.getIfReady(this.delegate.get(key));
+        }
+
+        /**
+         * 注意这里的absent指的是，有value且value已被计算出具体值了，计算中的也算absent
+         */
+        @Override
+        public V putIfAbsent(K key, V value) {
+            Objects.requireNonNull(value);
+            while(true) {   // 一直循环，直到value算出了结果
+                CompletableFuture<V> priorFuture = this.delegate.get(key);
+                if(priorFuture != null) {
+                    if(!priorFuture.isDone()) { // 有value但没算完，一定要等算完再继续，因为不确定最终结果，无法判断是否absent
+                        Async.getWhenSuccessful(priorFuture);
+                        continue;
+                    }
+                    // 算出结果了
+                    V prior = Async.getWhenSuccessful(priorFuture);
+                    if(prior != null)  // 有value说明不是absent，直接返回旧value
+                        return prior;
+                }
+
+                // 符合absent，尝试原子性写入
+                boolean[] added = { false };    // 当前线程是否可以真写入
+                CompletableFuture<V> computed = this.delegate.compute(key, (k, valueFuture) -> {
+                    added[0] = (valueFuture == null)    // value没有，可以写
+                            || (valueFuture.isDone() && (Async.getIfReady(valueFuture) == null));   // value == null，也可以写
+                    return added[0] ? CompletableFuture.completedFuture(value) : valueFuture;
+                }, false, false, false);
+
+                if(added[0]) {  // 如果是我写的，按照Map.putIfAbsent的原始语义，要返回null
+                    return null;
+                }else { // 其它线程写的，要等结果
+                    V prior = Async.getWhenSuccessful(computed);
+                    if(prior != null)
+                        return prior;
+                }
+            }
+        }
+
+        @Override
+        public V put(K key, V value) {
+            Objects.requireNonNull(value);
+            CompletableFuture<V> old = this.delegate.put(key, CompletableFuture.completedFuture(value));
+            return Async.getWhenSuccessful(old);
+        }
+
+        @Override
+        public V remove(Object key) {
+            CompletableFuture<V> old = this.delegate.remove(key);
+            return Async.getWhenSuccessful(old);
         }
 
         @Override
         public boolean remove(Object key, Object value) {
-            return false;
+            Objects.requireNonNull(key);
+            if(value == null)
+                return false;
+
+            K castedKey = (K)key;
+            boolean[] done = { false };
+            boolean[] removed = { false };
+            while(true) {
+                CompletableFuture<V> future = this.delegate.get(key);
+                if(future == null || future.isCompletedExceptionally())
+                    return false;
+                // value计算中，阻塞等待
+                Async.getWhenSuccessful(future);
+                this.delegate.compute(castedKey, (k, oldFuture) -> {
+                    if(oldFuture == null) { // value最终结果是null，原样返回
+                        done[0] = true;
+                        return null;
+                    }else if(oldFuture.isDone()) {  // 重点：上面已经阻塞等待过了，这里又有可能被其它线程提交新value了，要原样返回
+                        return oldFuture;
+                    }
+                    done[0] = true;
+                    V oldValue = Async.getIfReady(oldFuture);   // 终于取出旧value了
+                    removed[0] = value.equals(oldValue);    // 这个线程能不能删
+                    return oldValue == null || removed[0] ? null : oldFuture;
+                }, false, false, true);
+
+                if(done[0])
+                    return removed[0];
+            }
+        }
+
+        @Override
+        public V replace(K key, V value) {
+            Objects.requireNonNull(value);
+
+            V[] oldValue = (V[])new Object[1];
+            boolean[] done = { false }; // 有效判定，即得到了replace的最终结论，不需要再循环了
+            while(true) {
+                CompletableFuture<V> future = this.delegate.get(key);
+                if(future == null || future.isCompletedExceptionally()) // 没有value或计算错误则返回null
+                    return null;
+                // 等待旧值算完
+                Async.getWhenSuccessful(future);
+                this.delegate.compute(key, (k, oldFuture) -> {
+                    if(oldFuture == null) { // 计算结果value是null，则写入null
+                        done[0] = true;
+                        return null;
+                    }else if(!oldFuture.isDone()) { // 计算结果value又重新计算中了，value不变
+                        return oldFuture;
+                    }
+                    // 到这里说明确实能拿到算完的value了
+                    done[0] = true;
+                    oldValue[0] = Async.getIfReady(oldFuture);  // 再次检查旧值是否计算完毕，没算完就返回null
+                    return oldValue[0] == null ? null : CompletableFuture.completedFuture(value);
+                }, false, false, false);
+
+                if(done[0])
+                    return oldValue[0];
+            }
         }
 
         @Override
         public boolean replace(K key, V oldValue, V newValue) {
-            return false;
+            Objects.requireNonNull(oldValue);
+            Objects.requireNonNull(newValue);
+
+            boolean[] done = { false };
+            boolean[] replaced = { false };
+            while(true) {
+                CompletableFuture<V> future = this.delegate.get(key);
+                if(future == null || future.isCompletedExceptionally()) // 没有value或计算错误则返回false
+                    return false;
+                // 等待旧值算完
+                Async.getWhenSuccessful(future);
+                this.delegate.compute(key, (k, oldFuture) -> {
+                    if(oldFuture == null) {
+                        done[0] = true;
+                        return null;
+                    }else if(!oldFuture.isDone()) {
+                        return oldFuture;
+                    }
+
+                    done[0] = true;
+                    replaced[0] = oldValue.equals(Async.getIfReady(oldFuture)); // 检查oldValue是否一致
+                    return replaced[0] ? CompletableFuture.completedFuture(newValue) : oldFuture;
+                }, false, false, false);
+
+                if(done[0])
+                    return replaced[0];
+            }
+        }
+
+        @Override
+        public V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction) {
+            Objects.requireNonNull(mappingFunction);
+
+            while(true) {
+                CompletableFuture<V> priorFuture = this.delegate.get(key);
+                if(priorFuture != null) {
+                    if(!priorFuture.isDone()) { // 没算完就等
+                        Async.getWhenSuccessful(priorFuture);
+                        continue;
+                    }
+
+                    V prior = Async.getWhenSuccessful(priorFuture);
+                    if(prior != null) { // 有正常的旧值，命中缓存，退出不操作
+                        this.delegate.statsCounter().recordHits(1);
+                        return prior;
+                    }
+                }
+
+                // 写入新value
+                CompletableFuture<V>[] future = new CompletableFuture[1];
+                CompletableFuture<V> computed = this.delegate.compute(key, (k, valueFuture) -> {
+                    // 其它线程抢先写入并算完value了，不做修改
+                    if(valueFuture != null && valueFuture.isDone() && Async.getIfReady(valueFuture) != null)
+                        return valueFuture;
+
+                    V newValue = this.delegate.statsAware(mappingFunction, true).apply(key);
+                    if(newValue == null)
+                        return null;
+                    future[0] = CompletableFuture.completedFuture(newValue);
+                    return future[0];
+                }, false, false, false);
+
+                V result = Async.getWhenSuccessful(computed);
+                if(computed == future[0] || result != null) // 再次检查
+                    return result;
+            }
+        }
+
+        @Override
+        public V computeIfPresent(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+            Objects.requireNonNull(remappingFunction);
+
+            V[] newValue = (V[])new Object[1];
+            while(true) {
+                Async.getWhenSuccessful(this.delegate.get(key));
+                CompletableFuture<V> valueFuture = this.delegate.computeIfPresent(key, (k, oldFuture) -> {
+                    if(!oldFuture.isDone())
+                        return oldFuture;
+
+                    V oldValue = Async.getIfReady(oldFuture);
+                    if(oldValue == null)
+                        return null;
+
+                    // oldValue有值了，再更新
+                    newValue[0] = remappingFunction.apply(key, oldValue);
+                    return newValue[0] == null ? null : CompletableFuture.completedFuture(newValue[0]);
+                });
+
+                if(newValue[0] != null)
+                    return newValue[0];
+                else if(valueFuture == null)
+                    return null;
+            }
+        }
+
+        @Override
+        public @Nullable V compute(K key,
+                                   BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+            Objects.requireNonNull(remappingFunction);
+
+            V[] newValue = (V[]) new Object[1];
+            while(true) {
+                Async.getWhenSuccessful(this.delegate.get(key));
+                CompletableFuture<V> valueFuture = this.delegate.compute(key, (k, oldFuture) -> {
+                    if(oldFuture != null && !oldFuture.isDone())    // 有value但是没算完，就继续算，不替换
+                        return oldFuture;
+
+                    V oldValue = Async.getIfReady(oldFuture);
+                    var func = this.delegate.statsAware(remappingFunction,
+                            false, true, true);
+                    newValue[0] = func.apply(key, oldValue);
+                    return newValue[0] == null ? null : CompletableFuture.completedFuture(newValue[0]);
+                }, false, false, false);
+
+                if (newValue[0] != null)
+                    return newValue[0];
+                else if (valueFuture == null)
+                    return null;
+            }
+        }
+
+        @Override
+        public @Nullable V merge(K key, V value,
+                                 BiFunction<? super V, ? super V, ? extends V> remappingFunction) {
+            Objects.requireNonNull(value);
+            Objects.requireNonNull(remappingFunction);
+
+            CompletableFuture<V> newFuture = CompletableFuture.completedFuture(value);
+            boolean[] merged = { false };
+            while(true) {
+                Async.getWhenSuccessful(this.delegate.get(key));    // 先等稳定
+                CompletableFuture<V> mergedFuture = this.delegate.merge(key, newFuture, (oldFuture, valueFuture) -> {
+                    if(oldFuture != null && !oldFuture.isDone())    // 有value但是没算完，就继续算，不merge
+                        return oldFuture;
+
+                    merged[0] = true;
+                    V oldValue = Async.getIfReady(oldFuture);
+                    if(oldValue == null)    // 旧的value是null，则直接用新value
+                        return valueFuture;
+                    // 开始merge
+                    V mergedValue = remappingFunction.apply(oldValue, value);
+                    if(mergedValue == null)
+                        return null;
+                    else if(mergedValue == oldValue)
+                        return oldFuture;
+                    else if(mergedValue == value)
+                        return valueFuture;
+
+                    return CompletableFuture.completedFuture(mergedValue);
+                });
+
+                if(merged[0] || mergedFuture == newFuture)
+                    return Async.getWhenSuccessful(mergedFuture);
+            }
+        }
+
+        @Override
+        public Set<K> keySet() {
+            return this.delegate.keySet();
+        }
+
+        @Override
+        public Collection<V> values() {
+            return this.values == null ? (this.values = new Values()) : this.values;
+        }
+
+        @Override
+        public Set<Entry<K, V>> entrySet() {
+            return this.entries == null ? (this.entries = new EntrySet()) : this.entries;
+        }
+
+        /**
+         * 自定义的集合，用来当作values方法的返回value容器
+         */
+        private final class Values extends AbstractCollection<V> {
+            @Override
+            public boolean isEmpty() {
+                return AsMapView.this.isEmpty();
+            }
+
+            @Override
+            public int size() {
+                return AsMapView.this.size();
+            }
+
+            @Override
+            public boolean contains(Object obj) {
+                return AsMapView.this.containsValue(obj);
+            }
+
+            @Override
+            public void clear() {
+                AsMapView.this.clear();
+            }
+
+            @Override
+            public Iterator<V> iterator() {
+                return new Iterator<>() {
+                    Iterator<Entry<K, V>> iter = entrySet().iterator();
+
+                    @Override
+                    public boolean hasNext() {
+                        return this.iter.hasNext();
+                    }
+
+                    @Override
+                    public V next() {
+                        return this.iter.next().getValue();
+                    }
+
+                    @Override
+                    public void remove() {
+                        this.iter.remove();
+                    }
+                };
+            }
+        }
+
+        private final class EntrySet extends AbstractSet<Entry<K, V>> {
+            @Override
+            public boolean isEmpty() {
+                return AsMapView.this.isEmpty();
+            }
+
+            @Override
+            public int size() {
+                return AsMapView.this.size();
+            }
+
+            @Override
+            public boolean contains(Object obj) {
+                if(!(obj instanceof Entry<?, ?>))
+                    return false;
+                Entry<?, ?> entry = (Entry<?, ?>)obj;
+                Object key = entry.getKey();
+                Object value = entry.getValue();
+                if(key == null || value == null)
+                    return false;
+                V cachedValue = AsMapView.this.get(key);
+                return cachedValue != null && cachedValue.equals(value);
+            }
+
+            @Override
+            public boolean remove(Object obj) {
+                if(!(obj instanceof Entry<?, ?>))
+                    return false;
+                Entry<?, ?> entry = (Entry<?, ?>)obj;
+                return AsMapView.this.remove(entry.getKey(), entry.getValue());
+            }
+
+            @Override
+            public void clear() {
+                AsMapView.this.clear();
+            }
+
+            @Override
+            public Iterator<Entry<K, V>> iterator() {
+                return new Iterator<>() {
+                    // 应该是由LocalCache的具体实现类来提供
+                    Iterator<Entry<K, CompletableFuture<V>>> iter = delegate.entrySet().iterator();
+                    /** 下一个可用元素 */
+                    Entry<K, V> cursor;
+                    /** 刚刚返回给用户的Entry对应的key（remove会用到） */
+                    K removalKey;
+
+                    @Override
+                    public boolean hasNext() {
+                        // 异步背景下，要循环遍历，直到找到下一个计算完成且值不为null的才行
+                        while(this.cursor == null && this.iter.hasNext()) {
+                            var entry = this.iter.next();
+                            V value = Async.getIfReady(entry.getValue());
+                            if(value != null)
+                                this.cursor = new WriteThroughEntry<>(AsMapView.this, entry.getKey(), value);
+                        }
+                        return this.cursor != null;
+                    }
+
+                    @Override
+                    public Entry<K, V> next() {
+                        if(!this.hasNext())
+                            throw new NoSuchElementException();
+                        K key = this.cursor.getKey();
+                        Entry<K, V> entry = this.cursor;
+                        this.removalKey = key;
+                        this.cursor = null;
+                        return entry;
+                    }
+
+                    @Override
+                    public void remove() {
+                        Caffeine.requireState(this.removalKey != null);
+                        delegate.remove(this.removalKey);
+                        this.removalKey = null;
+                    }
+                };
+            }
+
+
         }
     }
 }

@@ -35,7 +35,7 @@ public class ConcurrentStatsCounter implements StatsCounter {
     }
 
     @Override
-    public void recordMissed(int count) {
+    public void recordMisses(int count) {
         this.missCount.add(count);
     }
 

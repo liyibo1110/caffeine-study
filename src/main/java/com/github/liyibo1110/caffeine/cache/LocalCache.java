@@ -102,7 +102,7 @@ interface LocalCache<K, V> extends ConcurrentMap<K, V> {
         // 开始装饰
         return key -> {
             R value;
-            this.statsCounter().recordMissed(1);    // 只要进来了说明之前就是未命中
+            this.statsCounter().recordMisses(1);    // 只要进来了说明之前就是未命中
             long startTime = this.statsTicker().read();
             try {
                 value = mappingFunction.apply(key); // 调用原来的function
@@ -135,7 +135,7 @@ interface LocalCache<K, V> extends ConcurrentMap<K, V> {
         return (t, u) -> {
             R result;
             if((u == null) && recordMiss)
-                this.statsCounter().recordMissed(1);
+                this.statsCounter().recordMisses(1);
             long startTime = this.statsTicker().read();
             try {
                 result = remappingFunction.apply(t, u);

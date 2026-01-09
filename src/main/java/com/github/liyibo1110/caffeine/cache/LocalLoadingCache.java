@@ -62,7 +62,7 @@ interface LocalLoadingCache<K, V> extends LocalManualCache<K, V>, LoadingCache<K
             }
         } catch (Throwable t) {
             // 记录失败后面的所有数量
-            this.cache().statsCounter().recordMissed(uniqueKeys.size() - count);
+            this.cache().statsCounter().recordMisses(uniqueKeys.size() - count);
             throw t;
         }
         return Collections.unmodifiableMap(result);

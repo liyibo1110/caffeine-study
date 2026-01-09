@@ -18,7 +18,7 @@ public interface StatsCounter {
     /**
      * 未命中缓存时被调用
      */
-    void recordMissed(int count);
+    void recordMisses(int count);
 
     /**
      * 记录新条目成功被加载（例如Cache.get或Map.computeIfAbsent），且加载成功时被调用
