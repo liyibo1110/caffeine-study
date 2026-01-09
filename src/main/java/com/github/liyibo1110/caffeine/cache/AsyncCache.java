@@ -29,7 +29,7 @@ public interface AsyncCache<K, V> {
 
     default CompletableFuture<Map<K, V>> getAll(
             Iterable<? extends K> keys,
-            BiFunction<Iterable<? extends K>, Executor, Map<K, V>> mappingFunction) {
+            BiFunction<Iterable<? extends K>, Executor, CompletableFuture<Map<K, V>>> mappingFunction) {
         throw new UnsupportedOperationException();
     }
 
