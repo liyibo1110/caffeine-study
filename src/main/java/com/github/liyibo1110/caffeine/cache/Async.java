@@ -88,7 +88,7 @@ final class Async {
         }
 
         Object writeReplace() {
-            return delegate;
+            return this.delegate;
         }
     }
 
