@@ -32,6 +32,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
+ * AsyncCache调用 -> LocalCache调用的桥接器
  * @author liyibo
  * @date 2026-01-07 17:58
  */
@@ -132,6 +133,19 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
             });
             return Collections.unmodifiableMap(result);
         });
+    }
+
+    @Override
+    default void put(K key, CompletableFuture<V> valueFuture) {
+        // 先检查value状态是否正常
+        if(valueFuture.isCompletedExceptionally() || (valueFuture.isDone() && valueFuture.join() == null)) {
+            this.cache().statsCounter().recordLoadFailure(0L);
+            this.cache().remove(key);
+            return;
+        }
+        long startTime = this.cache().statsTicker().read();
+        this.cache().put(key, valueFuture);
+        this.handleCompletion(key, valueFuture, startTime, false);
     }
 
     /**
@@ -437,7 +451,7 @@ public interface LocalAsyncCache<K, V> extends AsyncCache<K, V> {
     }
 
     /**
-     * 同步视图通用模板方法
+     * 同步视图通用模板方法（有loading和不带loading2个实现子版本）
      */
     abstract class AbstractCacheView<K, V> implements Cache<K, V>, Serializable {
         transient AsMapView<K, V> asMapView;

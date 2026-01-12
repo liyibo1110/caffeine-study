@@ -114,7 +114,7 @@ interface LocalLoadingCache<K, V> extends LocalManualCache<K, V>, LoadingCache<K
     }
 
     /**
-     * 将CacheLoader的实现实例，转换成Function类型
+     * 将CacheLoader的实现实例，转换（adapt）成Function类型
      * 目的是塞进参数为mappingFunction的方法里使用
      */
     static <K, V> Function<K, V> newMappingFunction(CacheLoader<? super K, V> cacheLoader) {
