@@ -43,6 +43,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
     /** entry最大过期时间 */
     static final long MAXIMUM_EXPIRY = (Long.MAX_VALUE >> 1); // 150年
 
+    final MpscGrowableArrayQueue<Runnable> writeBuffer;
+
 
     final CacheLoader<K, V> cacheLoader;
     final ReentrantLock evictionLock;
