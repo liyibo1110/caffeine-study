@@ -1,12 +1,20 @@
 package com.github.liyibo1110.caffeine.cache;
 
+import org.checkerframework.checker.nullness.qual.Nullable;
+
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 import java.util.AbstractMap;
 import java.util.Collection;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -44,19 +52,267 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
     static final long MAXIMUM_EXPIRY = (Long.MAX_VALUE >> 1); // 150年
 
     final MpscGrowableArrayQueue<Runnable> writeBuffer;
-
-
+    final ConcurrentHashMap<Object, Node<K, V>> data;
     final CacheLoader<K, V> cacheLoader;
+    final PerformCleanupTask drainBuffersTask;
+    final Consumer<Node<K, V>> accessPolicy;
+    final Buffer<Node<K, V>> readBuffer;
+    /**
+     * 这个NodeFactory类以及几十个子类，都是在编译期利用gradle插件和对应的模板代码动态生成出来的
+     * 目前国内网络环境没法正常对原始项目进行gradlew build操作，也就是无法预先生成出这些类，所以这个项目会有编译错误
+     */
+    final NodeFactory<K, V> nodeFactory;
     final ReentrantLock evictionLock;
     final CacheWriter<K, V> writer;
     final Weigher<K, V> weigher;
     final Executor executor;
-    final boolean async;
+    final boolean isAsync;
 
     /** 以下为集合视图 */
     transient Set<K> keySet;
     transient Collection<V> values;
     transient Set<Entry<K, V>> entrySet;
+
+    protected BoundedLocalCache(Caffeine<K, V> builder, CacheLoader<K, V> cacheLoader, boolean isAsync) {
+        this.isAsync = isAsync;
+        this.cacheLoader = cacheLoader;
+        this.executor = builder.getExecutor();
+        this.evictionLock = new ReentrantLock();
+        this.weigher = builder.getWeigher(isAsync);
+        this.writer = builder.getCacheWriter(isAsync);
+        this.drainBuffersTask = new PerformCleanupTask(this);
+        this.nodeFactory = NodeFactory.newFactory(builder, isAsync);
+        this.data = new ConcurrentHashMap<>(builder.getInitialCapacity());
+        this.readBuffer = this.evicts() || this.collectKeys() || this.collectValues() || this.expiresAfterAccess()
+                ? new BoundedBuffer<>() : Buffer.disabled();
+        this.accessPolicy = (this.evicts() || this.expiresAfterAccess()) ? this::onAccess : e -> {};
+        this.writeBuffer = new MpscGrowableArrayQueue<>(WRITE_BUFFER_MIN, WRITE_BUFFER_MAX);
+    }
+
+    /* --------------- Reference Support相关 --------------- */
+
+    /**
+     * key是否是weak引用且可以被GC自动回收
+     */
+    protected boolean collectKeys() {
+        return false;
+    }
+
+    /**
+     * value是否是weak引用且可以被GC自动回收
+     */
+    protected boolean collectValues() {
+        return false;
+    }
+
+    protected ReferenceQueue<K> keyReferenceQueue() {
+        return null;
+    }
+
+    protected ReferenceQueue<V> valueReferenceQueue() {
+        return null;
+    }
+
+    /* --------------- Expiration Support相关 --------------- */
+    protected Pacer pacer() {
+        return null;
+    }
+
+    /**
+     * 是否在可变时间阈值后entry过期
+     */
+    protected boolean expiresVariable() {
+        return false;
+    }
+
+    /**
+     * 是否在访问后一定时间entry过期
+     */
+    protected boolean expiresAfterAccess() {
+        return false;
+    }
+
+    /**
+     * entry被访问后，保留该entry的时间长度
+     */
+    protected long expiresAfterAccessNanos() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setExpiresAfterAccessNanos(long expireAfterAccessNanos) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 是否在写入后一定时间entry过期
+     */
+    protected boolean expiresAfterWrite() {
+        return false;
+    }
+
+    /**
+     * entry被写入后，保留该entry的时间长度
+     */
+    protected long expiresAfterWriteNanos() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setExpiresAfterWriteNanos(long expireAfterWriteNanos) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 是否在写入后一定时间entry能自动刷新
+     */
+    protected boolean refreshAfterWrite() {
+        return false;
+    }
+
+    /**
+     * entry被写入后，等待下次刷新的时间长度
+     */
+    protected long refreshAfterWriteNanos() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setRefreshAfterWriteNanos(long refreshAfterWriteNanos) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public boolean hasWriteTime() {
+        return this.expiresAfterWrite() || this.refreshAfterWrite();
+    }
+
+    protected Expiry<K, V> expiry() {
+        return null;
+    }
+
+    @Override
+    public Ticker expirationTicker() {
+        return Ticker.disabledTicker();
+    }
+
+    protected TimerWheel<K, V> timerWheel() {
+        throw new UnsupportedOperationException();
+    }
+
+    /* --------------- Eviction Support相关 --------------- */
+
+    /**
+     * 是否带有驱逐功能（达到最大大小或权重阈值）
+     */
+    protected boolean evicts() {
+        return false;
+    }
+
+    /**
+     * 是否entry带有权重功能
+     */
+    protected boolean isWeighted() {
+        return this.weigher != Weigher.singleonWeigher();
+    }
+
+
+    /**
+     * 尝试根据给定原因来移除entry
+     * 如果entry已更新且不再符合移除条件，则可能忽略移除
+     */
+    boolean evictEntry(Node<K, V> node, RemovalCause cause, long now) {
+        return false;
+    }
+
+
+
+
+
+    /**
+     * 尝试调度一个异步任务来清理buffer
+     */
+    void scheduleDrainBuffers() {
+
+    }
+
+    @Override
+    public void cleanUp() {
+        try {
+            this.performCleanUp(null);
+        } catch (RuntimeException e) {
+            this.logger.log(Level.SEVERE, "Exception thrown when performing the maintenance task", e);
+        }
+    }
+
+    /**
+     * 执行维护工作，并阻塞直到获取锁
+     * 内部任何抛出的异常，都会传播给调用者
+     */
+    void performCleanUp(Runnable task) {
+        this.evictionLock.lock();
+        try {
+            this.maintenance(task);
+        } finally {
+            this.evictionLock.unlock();
+        }
+        if(drainStatus() == REQUIRED && this.executor == ForkJoinPool.commonPool())
+            this.scheduleDrainBuffers();
+    }
+
+    void maintenance(Runnable task) {
+
+    }
+
+    /**
+     * 尝试更新Node的内部类型
+     */
+    void onAccess(Node<K, V> node) {
+
+    }
+
+    static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
+        private static final long serialVersionUID = 1L;
+
+        final WeakReference<BoundedLocalCache<?, ?>> reference;
+
+        PerformCleanupTask(BoundedLocalCache<?, ?> cache) {
+            reference = new WeakReference<>(cache);
+        }
+
+        @Override
+        protected boolean exec() {
+            try {
+                this.run();
+            } catch (Throwable t) {
+                logger.log(Level.SEVERE, "Exception thrown when performing the maintenance task", t);
+            }
+            return false;
+        }
+
+        @Override
+        public void run() {
+            BoundedLocalCache<?, ?> cache = this.reference.get();
+            if(cache != null)
+                cache.performCleanUp(null);
+        }
+
+        @Override
+        public Void getRawResult() {
+            return null;
+        }
+
+        @Override
+        protected void setRawResult(Void value) {}
+
+        @Override
+        public void complete(Void value) {}
+
+        @Override
+        public void completeExceptionally(Throwable ex) {}
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            return false;
+        }
+    }
 }
 
 /**

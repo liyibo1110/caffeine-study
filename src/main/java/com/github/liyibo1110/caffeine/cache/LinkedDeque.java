@@ -13,27 +13,27 @@ import java.util.NoSuchElementException;
 public interface LinkedDeque<E> extends Deque<E> {
 
     /**
-     * 给定实例是否等于队首元素
+     * 给定实例是否为队首元素（元素要在队列里）
      */
     boolean isFirst(E e);
 
     /**
-     * 给定实例是否等于队尾元素
+     * 给定实例是否为队尾元素（元素要在队列里）
      */
     boolean isLast(E e);
 
     /**
-     * 给定实例移至队首
+     * 给定实例移至队首（元素要在队列里）
      */
     void moveToFront(E e);
 
     /**
-     * 给定实例移至队尾
+     * 给定实例移至队尾（元素要在队列里）
      */
     void moveToBack(E e);
 
     /**
-     * 返回给定实例的前一个元素
+     * 返回给定实例的前一个元素（元素要在队列里）
      */
     E getPrevious(E e);
 
@@ -43,7 +43,7 @@ public interface LinkedDeque<E> extends Deque<E> {
     void setPrevious(E e, E prev);
 
     /**
-     * 返回给定实例的后一个元素
+     * 返回给定实例的后一个元素（元素要在队列里）
      */
     E getNext(E e);
 
