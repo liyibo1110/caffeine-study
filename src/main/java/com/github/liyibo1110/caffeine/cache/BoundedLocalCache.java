@@ -1,12 +1,13 @@
 package com.github.liyibo1110.caffeine.cache;
 
-import org.checkerframework.checker.nullness.qual.Nullable;
+import com.github.liyibo1110.caffeine.cache.stats.StatsCounter;
 
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.util.AbstractMap;
 import java.util.Collection;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
@@ -87,6 +88,88 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
                 ? new BoundedBuffer<>() : Buffer.disabled();
         this.accessPolicy = (this.evicts() || this.expiresAfterAccess()) ? this::onAccess : e -> {};
         this.writeBuffer = new MpscGrowableArrayQueue<>(WRITE_BUFFER_MIN, WRITE_BUFFER_MAX);
+        if(this.evicts())
+            this.setMaximumSize(builder.getMaximum());
+    }
+
+    /* --------------- 通用部分 --------------- */
+
+    /**
+     * 如果是异步模式，返回value是否还在计算中
+     */
+    final boolean isComputingAsync(Node<?, ?> node) {
+        return this.isAsync && !Async.isReady((CompletableFuture<?>)node.getValue());
+    }
+
+    protected AccessOrderDeque<Node<K, V>> accessOrderWindowDeque() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected AccessOrderDeque<Node<K, V>> accessOrderProbationDeque() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected AccessOrderDeque<Node<K, V>> accessOrderProtectedDeque() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected WriteOrderDeque<Node<K, V>> writeOrderDeque() {
+        throw new UnsupportedOperationException();
+    }
+
+    public final Executor executor() {
+        return this.executor;
+    }
+
+    protected boolean hasWriter() {
+        return this.writer != CacheWriter.disabledWriter();
+    }
+
+    /* --------------- Stats Support相关 --------------- */
+
+    @Override
+    public boolean isRecordingStats() {
+        return false;
+    }
+
+    @Override
+    public StatsCounter statsCounter() {
+        return StatsCounter.disabledStatsCounter();
+    }
+
+    @Override
+    public Ticker statsTicker() {
+        return Ticker.disabledTicker();
+    }
+
+    /* --------------- Removal Listener Support相关 --------------- */
+
+    @Override
+    public RemovalListener<K, V> removalListener() {
+        return null;
+    }
+
+    @Override
+    public boolean hasRemovalListener() {
+        return false;
+    }
+
+    @Override
+    public void notifyRemoval(K key, V value, RemovalCause cause) {
+        Caffeine.requireState(this.hasRemovalListener(), "Notification should be guarded with a check");
+        Runnable task = () -> {
+            try{
+                this.removalListener().onRemoval(key, value, cause);
+            } catch (Throwable t) {
+                this.logger.log(Level.WARNING, "Exception thrown by removal listener", t);
+            }
+        };
+        try {
+            this.executor.execute(task);
+        } catch (Throwable t) {
+            this.logger.log(Level.SEVERE, "Exception thrown when submitting removal listener", t);
+            task.run(); // 同步执行
+        }
     }
 
     /* --------------- Reference Support相关 --------------- */
@@ -114,6 +197,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
     }
 
     /* --------------- Expiration Support相关 --------------- */
+
     protected Pacer pacer() {
         return null;
     }
@@ -213,6 +297,174 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
         return this.weigher != Weigher.singleonWeigher();
     }
 
+    protected FrequencySketch<K> frequencySketch() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 是否可以跳过对entry的访问时的通知淘汰策略
+     */
+    protected boolean fastpath() {
+        return false;
+    }
+
+    /**
+     * 返回最大weight值
+     */
+    protected long maximum() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 返回window space的最大weight值
+     */
+    protected long windowMaximum() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 返回main protected的最大weight值
+     */
+    protected long mainProtectedMaximum() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setMaximum(long maximum) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setWindowMaximum(long maximum) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setMainProtectedMaximum(long maximum) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 返回cache中value的总weight值（可能为负值）
+     */
+    protected long weightedSize() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 返回cache中value的总window space weight值（可能为负值）
+     */
+    protected long windowWeightedSize() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 返回cache中value的总main protected weight值（可能为负值）
+     */
+    protected long mainProtectedWeightedSize() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setWeightedSize(long weightedSize) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setWindowWeightedSize(long weightedSize) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setMainProtectedWeightedSize(long weightedSize) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected int hitsInSample() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected int missesInSample() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected int sampleCount() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected double stepSize() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected double previousSampleHitRate() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected long adjustment() {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setHitsInSample(int hitCount) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setMissesInSample(int missCount) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setSampleCount(int sampleCount) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setStepSize(double stepSize) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setPreviousSampleHitRate(double hitRate) {
+        throw new UnsupportedOperationException();
+    }
+
+    protected void setAdjustment(long amount) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * 设置cache的最大加权大小
+     * 调用方可能需要主动移除entry，直到cache缩减到适当的大小
+     */
+    void setMaximumSize(long maximum) {
+        Caffeine.requireArgument(maximum >= 0, "maximum must not be negative");
+        if(maximum == this.maximum())
+            return;
+
+        long max = Math.min(maximum, MAXIMUM_CAPACITY);
+        long window = max - (long)(PERCENT_MAIN * max);
+        long mainProtected = (long)(PERCENT_MAIN_PROTECTED * (max - window));
+
+        this.setMaximum(max);
+        this.setWindowMaximum(window);
+        this.setMainProtectedMaximum(mainProtected);
+
+        this.setHitsInSample(0);
+        this.setMissesInSample(0);
+        this.setStepSize(-HILL_CLIMBER_STEP_PERCENT * max);
+
+        // 是否要初始化FrequencySketch组件
+        if(this.frequencySketch() != null && !this.isWeighted() && this.weightedSize() >= (max >>> 1))
+            this.frequencySketch().ensureCapacity(max);
+    }
+
+    /**
+     * 如果cache大小超出了maximum，则触发清理
+     */
+    void evictEntries() {
+        if(!this.evicts())
+            return;
+        int candidates = this.evictFromWindow();
+        this.evictFromMain(candidates);
+    }
+
+    int evictFromWindow() {
+        return 0;
+    }
+
+    void evictFromMain(int candidates) {
+
+    }
 
     /**
      * 尝试根据给定原因来移除entry
@@ -221,10 +473,6 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
     boolean evictEntry(Node<K, V> node, RemovalCause cause, long now) {
         return false;
     }
-
-
-
-
 
     /**
      * 尝试调度一个异步任务来清理buffer

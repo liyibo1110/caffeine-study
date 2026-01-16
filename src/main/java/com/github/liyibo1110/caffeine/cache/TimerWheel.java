@@ -217,6 +217,10 @@ public class TimerWheel<K, V> {
         return Long.MAX_VALUE;
     }
 
+    /**
+     * 在getExpirationDelay()方法里，如果在更细的bucket中找到了非空bucket，也不代表里面的Node即将到期，
+     * 还要判断更粗的bucket在更早是否发生了转动，从而把一批Node下放到更细层，导致更早到期
+     */
     long peekAhead(int i) {
         long ticks = this.nanos >>> SHIFT[i];
         Node<K, V>[] timerWheel = this.wheel[i];
