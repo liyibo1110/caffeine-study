@@ -12,6 +12,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -458,20 +459,494 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
         this.evictFromMain(candidates);
     }
 
+    /**
+     * 尝试清理window区，变成main区的probation
+     */
     int evictFromWindow() {
-        return 0;
+        int candidates = 0;
+        // 根据LRU算法定义，peek应该取出的是最老的，即最久没有被访问的（注意这些双端队列，写入都是写入last，然后从first取）
+        Node<K, V> node = this.accessOrderWindowDeque().peek();
+        while(this.windowWeightedSize() > this.windowMaximum()) {
+            if(node == null)
+                break;
+
+            Node<K, V> next = node.getNextInAccessOrder();
+            if(node.getPolicyWeight() != 0) {
+                node.makeMainProbation();   // 直接降低到main区的probation
+                accessOrderWindowDeque().remove(node);  // 从window队列中移除
+                accessOrderProbationDeque().add(node);  // 写入probation队列
+                candidates++;
+                this.setWindowWeightedSize(this.windowWeightedSize() - node.getPolicyWeight());
+            }
+            node = next;
+        }
+        return candidates;
     }
 
+    /**
+     * 尝试清理main区
+     */
     void evictFromMain(int candidates) {
+        int victimQueue = Node.PROBATION;
+        Node<K, V> victim = this.accessOrderProbationDeque().peekFirst(); // probation队列里最老的，用的还是LRU，大概率会被清理
+        Node<K, V> candidate = this.accessOrderProbationDeque().peekLast(); // 刚从window转到probation的，清理优先级低于probation
+        while(this.weightedSize() > this.maximum()) {
+            if(candidates == 0) // 优先使用window显式推下来的，如果处理完了空间依然不够，还是优先处理window里面的
+                candidate = this.accessOrderWindowDeque().peekLast();   // 注意这里的candidate指的是window里面最热门的，它想通过竞争进入protected
 
+
+            if(candidate == null && victim == null) {   // 如果window和probation都没有entry了，只能尝试从protected清理
+                if(victimQueue == Node.PROBATION) {
+                    victim = this.accessOrderProtectedDeque().peekFirst();
+                    victimQueue = Node.PROTECTED;
+                    continue;
+                }else if(victimQueue == Node.PROTECTED) {   // 如果连protected也没了，则只能再从window尝试清理
+                    victim = this.accessOrderWindowDeque().peekFirst();
+                    victimQueue = Node.WINDOW;
+                    continue;
+                }
+                break;  // 到这里说明3个队列都没有东西了，整个清理结束
+            }
+
+            // 跳过weight为0的（僵尸node）
+            if(victim != null && victim.getPolicyWeight() == 0) {
+                victim = victim.getNextInAccessOrder();
+                continue;
+            }else if(candidate != null && candidate.getPolicyWeight() == 0) {
+                candidate = candidates > 0 ? candidate.getPreviousInAccessOrder() : candidate.getNextInAccessOrder();
+                candidates--;
+                continue;
+            }
+
+            // 说明只有window有东西，但是weight也超了，只能直接移除candidate，这一步也确保了整个evict过程不会进入死循环
+            if(victim == null) {
+                Node<K, V> previous = candidate.getPreviousInAccessOrder();
+                Node<K, V> evict = candidate;
+                candidate = previous;
+                candidates--;
+                this.evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }else if(candidate == null) {   // 反之，window没有东西了，只能直接移除probation
+                Node<K, V> evict = victim;
+                victim = victim.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }
+
+            // 竞争继续，如果发现key变成null了，说明是weak引用并且已被GC回收了，要直接清理
+            K victimKey = victim.getKey();
+            K candidateKey = candidate.getKey();
+            if(victimKey == null) {
+                Node<K, V> evict = victim;
+                victim = victim.getNextInAccessOrder();
+                this.evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }else if(candidateKey == null) {
+                Node<K, V> evict = candidate;
+                candidate = candidates > 0 ? candidate.getPreviousInAccessOrder() : candidate.getNextInAccessOrder();
+                candidates--;
+                this.evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }
+
+            // 竞争继续，如果candidate本身单个weight就已经吵了，直接清理
+            if(candidate.getPolicyWeight() > maximum()) {
+                Node<K, V> evict = candidate;
+                candidate = candidates > 0 ? candidate.getPreviousInAccessOrder() : candidate.getNextInAccessOrder();
+                candidates--;
+                this.evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }
+
+            // 最终竞争，一定要从candidate和victim选出一个来清理了
+            candidates--;
+            if(this.admit(candidateKey, victimKey)) {
+                // candidate赢了
+                Node<K, V> evict = victim;
+                victim = victim.getNextInAccessOrder();
+                this.evictEntry(evict, RemovalCause.SIZE, 0L);
+                candidate = candidate.getPreviousInAccessOrder();   // 在probation中留下了，不再参与比赛
+            }else {
+                // victim赢了
+                Node<K, V> evict = candidate;
+                candidate = candidates > 0 ? candidate.getPreviousInAccessOrder() : candidate.getNextInAccessOrder();
+                this.evictEntry(evict, RemovalCause.SIZE, 0L);
+            }
+        }
     }
+
+    /**
+     * 竞争candidate和victim，看谁应该留下，谁被清理
+     * 比较方式是利用FrequencySketch组件，看谁更流行
+     * @return 如果candidate赢了，要被留下，则返回true
+     */
+    boolean admit(K candidateKey, K victimKey) {
+        int candidateFreq = this.frequencySketch().frequency(candidateKey);
+        int victimFreq = this.frequencySketch().frequency(victimKey);
+        if(candidateFreq > victimFreq)
+            return true;
+        else if(candidateFreq <= 5)  // 注意candidated的流行度小于等于5才直接算失败，否则随机失败一个
+            return false;
+
+        int random = ThreadLocalRandom.current().nextInt();
+        return (random & 127) == 0;
+    }
+
+    /**
+     * 触发基于时间过期的清理
+     */
+    void expireEntries() {
+        long now = this.expirationTicker().read();
+        this.expireAfterAccessEntries(now);
+        this.expireAfterWriteEntries(now);
+        this.expireVariableEntries(now);
+
+        // 注意是在这里预约了下一次maintenance的触发时间
+        Pacer pacer = this.pacer();
+        if(pacer != null) {
+            long delay = this.getExpirationDelay(now);
+            if(delay == Long.MAX_VALUE)
+                pacer.cancel();
+            else
+                pacer.schedule(this.executor, this.drainBuffersTask, now, delay);
+        }
+    }
+
+    void expireAfterAccessEntries(long now) {
+        if(!this.expiresAfterAccess())
+            return;
+
+        this.expireAfterAccessEntries(this.accessOrderWindowDeque(), now);
+        if(this.evicts()) {
+            this.expireAfterAccessEntries(this.accessOrderProbationDeque(), now);
+            this.expireAfterAccessEntries(this.accessOrderProtectedDeque(), now);
+        }
+    }
+
+    void expireAfterAccessEntries(AccessOrderDeque<Node<K, V>> deque, long now) {
+        long duration = this.expiresAfterAccessNanos(); // 即写死的过期时长，比如1小时
+        // 会遍历整个队列
+        while(true) {
+            Node<K, V> node = deque.peekFirst();
+            if(node == null || (now - node.getAccessTime()) < duration || !this.evictEntry(node, RemovalCause.EXPIRED, now))
+                return;
+        }
+    }
+
+    void expireAfterWriteEntries(long now) {
+        if(!this.expiresAfterWrite())
+            return;
+        long duration = this.expiresAfterWriteNanos(); // 即写死的过期时长，比如1小时
+        while(true) {
+            Node<K, V> node = this.writeOrderDeque().peekFirst();
+            if(node == null || (now - node.getWriteTime()) < duration || !this.evictEntry(node, RemovalCause.EXPIRED, now))
+                return;
+        }
+    }
+
+    void expireVariableEntries(long now) {
+        if(this.expiresVariable())
+            this.timerWheel().advance(now);
+    }
+
+    /**
+     * 计算下一个Node最快过期的时间（找所有deque）
+     */
+    private long getExpirationDelay(long now) {
+        long delay = Long.MAX_VALUE;
+        if(this.expiresAfterAccess()) {
+            Node<K, V> node = this.accessOrderWindowDeque().peekFirst();
+            if(node != null)
+                delay = Math.min(delay, this.expiresAfterAccessNanos() - (now - node.getAccessTime()));
+            if(this.evicts()) {
+                node = this.accessOrderProbationDeque().peekFirst();
+                if(node != null)
+                    delay = Math.min(delay, this.expiresAfterAccessNanos() - (now - node.getAccessTime()));
+                node = this.accessOrderProtectedDeque().peekFirst();
+                if(node != null)
+                    delay = Math.min(delay, this.expiresAfterAccessNanos() - (now - node.getAccessTime()));
+            }
+        }
+
+        if(this.expiresAfterWrite()) {
+            Node<K, V> node = this.writeOrderDeque().peekFirst();
+            if(node != null)
+                delay = Math.min(delay, this.expiresAfterWriteNanos() - (now - node.getWriteTime()));
+        }
+
+        if(this.expiresVariable()) {
+            delay = Math.min(delay, this.timerWheel().getExpirationDelay());
+        }
+        return delay;
+    }
+
+    /**
+     * 返回node是否过期
+     */
+    boolean hasExpired(Node<K, V> node, long now) {
+        if(this.isComputingAsync(node))
+            return false;
+        return (this.expiresAfterAccess() && (now - node.getAccessTime() >= this.expiresAfterAccessNanos()))
+            | (this.expiresAfterWrite() && (now - node.getWriteTime() >= this.expiresAfterWriteNanos()))
+            | (this.expiresVariable() && (now - node.getVariableTime() >= 0));
+    }
+
 
     /**
      * 尝试根据给定原因来移除entry
      * 如果entry已更新且不再符合移除条件，则可能忽略移除
+     * @param now 当前时间，只在expring功能被使用（eviction功能则会被传入0）
      */
     boolean evictEntry(Node<K, V> node, RemovalCause cause, long now) {
-        return false;
+        K key = node.getKey();
+        V[] value = (V[])new Object[1];
+        boolean[] removed = new boolean[1];
+        boolean[] resurrect = new boolean[1];   // 是否又活了
+        RemovalCause[] actualCause = new RemovalCause[1];
+
+        // 再次提醒注意data里面的key，是个Reference，value存的才是Node<K, V>，基础结构别搞错了
+        this.data.computeIfPresent(node.getKeyReference(), (k, n) -> {
+            if(n != node)
+                return n;
+            synchronized(n) {
+                value[0] = n.getValue();
+
+                if(key == null || value[0] == null) {
+                    actualCause[0] = RemovalCause.COLLECTED;
+                }else if(cause == RemovalCause.COLLECTED) {
+                    resurrect[0] = true;
+                    return n;
+                }else {
+                    actualCause[0] = cause;
+                }
+
+                if(actualCause[0] == RemovalCause.EXPIRED) {
+                    boolean expired = false;
+                    if(this.expiresAfterAccess())
+                        expired |= (now - n.getAccessTime()) >= this.expiresAfterAccessNanos();
+                    if(this.expiresAfterWrite())
+                        expired |= (now - n.getWriteTime()) >= this.expiresAfterWriteNanos();
+                    if(this.expiresVariable())
+                        expired |= (n.getVariableTime() <= now);
+                    if(!expired) {
+                        resurrect[0] = true;
+                        return n;
+                    }
+                }else if(actualCause[0] == RemovalCause.SIZE) {
+                    int weight = node.getWeight();
+                    if(weight == 0) {
+                        resurrect[0] = true;
+                        return n;
+                    }
+                }
+                this.writer.delete(key, value[0], actualCause[0]);
+                // 注意makeDead只是改变了node的状态为dead，并且减少了cache的各个weight，队列之类的还都没有进行清理
+                this.makeDead(n);
+            }
+            removed[0] = true;
+            return null;
+        });
+
+        if(resurrect[0])
+            return false;
+
+        // 将被清理的node移除出各个队列
+        if(node.inWindow() && (this.evicts() || this.expiresAfterAccess())) {
+            this.accessOrderWindowDeque().remove(node);
+        }else if(this.evicts()) {
+            if(node.inMainProbation())
+                this.accessOrderProbationDeque().remove(node);
+            else
+                this.accessOrderProtectedDeque().remove(node);
+        }
+        if(this.expiresAfterWrite())
+            this.writeOrderDeque().remove(node);
+        else if(this.expiresVariable())
+            this.timerWheel().deschedule(node);
+
+        if(removed[0]) {
+            this.statsCounter().recordEviction(node.getWeight(), actualCause[0]);
+            if(this.hasRemovalListener())
+                this.notifyRemoval(key, value[0], actualCause[0]);
+        }else {
+            this.makeDead(node);
+        }
+        return true;
+    }
+
+    /**
+     * 根据最近一段时间的命中率变化，动态调整window（偏重recency，即最热）和main（偏重frequency，即访问频率最高）的配额比例
+     */
+    void climb() {
+        if(!this.evicts())
+            return;
+
+        this.determineAdjustment();
+        this.demoteFromMainProtected();
+        long amount = this.adjustment();
+        if(amount == 0)
+            return;
+        else if(amount > 0)
+            increaseWindow();
+        else
+            decreaseWindow();
+    }
+
+    /**
+     * 计算并设置要调整的配额比例
+     */
+    void determineAdjustment() {
+        if(this.frequencySketch().isNotInitialized()) {
+            this.setPreviousSampleHitRate(0.0);
+            this.setMissesInSample(0);
+            this.setHitsInSample(0);
+            return;
+        }
+
+        int requestCount = this.hitsInSample() + this.missesInSample();
+        if(requestCount < this.frequencySketch().sampleSize)    // 样本不够
+            return;
+
+        double hitRate = (double)this.hitsInSample() / requestCount;
+        // 命中率和上一轮的变化，为正说明这轮调整的好（要继续正向调节），为负说明这轮调整的差（要反向调节了）
+        double hitRateChange = hitRate - this.previousSampleHitRate();
+        double amount = hitRateChange >= 0 ? this.stepSize() : -this.stepSize();
+        // 更新步长，标准的爬山算法（hill-climbing）
+        double nextStepSize = Math.abs(hitRateChange) >= HILL_CLIMBER_RESTART_THRESHOLD
+                ? HILL_CLIMBER_STEP_PERCENT * this.maximum() * amount >= 0 ? 1 : -1 // 变化很大（说明需要优化）就用最大值的某个百分比
+                : HILL_CLIMBER_STEP_DECAY_RATE * amount;    // 变化不大（说明接近最优）就只衰减一点
+        this.setPreviousSampleHitRate(hitRate);
+        this.setAdjustment((long)amount);
+        this.setStepSize(nextStepSize);
+        this.setMissesInSample(0);
+        this.setHitsInSample(0);
+    }
+
+    /**
+     * 增加window容量（amount > 0）
+     * 含义：最近调大window后，命中率上升了，说明“新近访问”更重要
+     */
+    void increaseWindow() {
+        if(this.mainProtectedMaximum() == 0)
+            return;
+
+        long quota = Math.min(this.adjustment(), this.mainProtectedMaximum());
+        this.setMainProtectedMaximum(this.mainProtectedMaximum() - quota);
+        this.setWindowMaximum(this.windowMaximum() + quota);
+        this.demoteFromMainProtected();
+
+        // 开始从probation或者protected往window里面迁移一些Node
+        for(int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
+            Node<K, V> candidate = this.accessOrderProbationDeque().peek();
+            boolean probation = true;
+            if(candidate == null || quota < candidate.getPolicyWeight()) {
+                candidate = this.accessOrderProtectedDeque().peek();
+                probation = false;
+            }
+            if(candidate == null)
+                break;
+            int weight = candidate.getPolicyWeight();
+            if(quota < weight)
+                break;
+            quota -= weight;
+            if(probation) {
+                this.accessOrderProbationDeque().remove(candidate);
+            }else {
+                this.setMainProtectedWeightedSize(this.mainProtectedWeightedSize() - weight);
+                this.accessOrderProtectedDeque().remove(candidate);
+            }
+            this.setWindowWeightedSize(this.windowWeightedSize() + weight);
+            this.accessOrderWindowDeque().add(candidate);
+            candidate.makeWindow();
+        }
+
+        this.setMainProtectedMaximum(this.mainProtectedMaximum() + quota);
+        this.setWindowMaximum(this.windowMaximum() - quota);
+        this.setAdjustment(quota);
+    }
+
+    /**
+     * 减少window容量（amount < 0）
+     * 含义：最近调大window后，命中率下降了，说明“长期热点”更重要
+     */
+    void decreaseWindow() {
+        if(this.windowMaximum() <= 1)
+            return;
+
+        long quota = Math.min(-this.adjustment(), Math.max(0, this.windowMaximum() - 1));
+        this.setMainProtectedMaximum(this.mainProtectedMaximum() + quota);
+        this.setWindowMaximum(this.windowMaximum() - quota);
+
+        for(int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
+            Node<K, V> candidate = this.accessOrderWindowDeque().peek();
+            if(candidate == null)
+                break;
+
+            int weight = candidate.getPolicyWeight();
+            if(quota < weight)
+                break;
+
+            quota -= weight;
+            this.setWindowWeightedSize(this.windowWeightedSize() - weight);
+            this.accessOrderWindowDeque().remove(candidate);
+            this.accessOrderProbationDeque().add(candidate);
+            candidate.makeMainProbation();
+        }
+
+        this.setMainProtectedMaximum(this.mainProtectedMaximum() - quota);
+        this.setWindowMaximum(this.windowMaximum() + quota);
+        this.setAdjustment(-quota);
+    }
+
+    /**
+     * 如果protected区超出配额了，则要调整回去（protected -> probation）
+     */
+    void demoteFromMainProtected() {
+        long mainProtectedMaximum = this.mainProtectedMaximum();
+        long mainProtectedWeightedSize = this.mainProtectedWeightedSize();
+        if(mainProtectedWeightedSize <= mainProtectedMaximum)
+            return;
+
+        for(int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
+            // 容量不超出了就可以停止了
+            if(mainProtectedWeightedSize <= mainProtectedMaximum)
+                break;
+
+            // 从protected队列转到probation队列
+            Node<K, V> demoted = this.accessOrderProtectedDeque().poll();
+            if(demoted == null)
+                break;
+            demoted.makeMainProbation();
+            this.accessOrderProbationDeque().add(demoted);
+            mainProtectedWeightedSize -= demoted.getPolicyWeight();
+        }
+        this.setMainProtectedWeightedSize(mainProtectedWeightedSize);
+    }
+
+    /**
+     * 对cache进行读取操作后，要做的事情
+     */
+    void afterRead(Node<K, V> node, long now, boolean recordHit) {
+        if(recordHit)
+            this.statsCounter().recordHits(1);
+        boolean delayable = this.skipReadBuffer() || this.readBuffer.offer(node) != Buffer.FULL;
+        if(this.shouldDrainBuffers(delayable))
+            this.scheduleDrainBuffers();
+        this.refreshIfNeeded(node, now);
+    }
+
+    /**
+     * 是否跳过readBuffer处理
+     */
+    boolean skipReadBuffer() {
+        return this.fastpath() && this.frequencySketch().isNotInitialized();
+    }
+
+    /**
+     * 如果符合条件，则异步刷新Node
+     */
+    void refreshIfNeeded(Node<K, V> node, long now) {
+
     }
 
     /**
@@ -515,6 +990,25 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
     void onAccess(Node<K, V> node) {
 
     }
+
+    /**
+     * 将Node转换成dead状态，并减少weighted的值
+     */
+    void makeDead(Node<K, V> node) {
+        synchronized(node) {
+            if(node.isDead())
+                return;
+            if(this.evicts()) {
+                if(node.inWindow())
+                    this.setWindowWeightedSize(this.windowWeightedSize() - node.getWeight());
+                else if(node.inMainProtected())
+                    this.setMainProtectedWeightedSize(this.mainProtectedWeightedSize() - node.getWeight());
+                this.setWeightedSize(this.weightedSize() - node.getWeight());
+            }
+            node.die();
+        }
+    }
+
 
     static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
         private static final long serialVersionUID = 1L;
