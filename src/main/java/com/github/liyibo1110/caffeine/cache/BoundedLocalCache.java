@@ -1360,7 +1360,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
             if(isComputingAsync(this.node)) {   // 如果时async模式，并且value还没计算完
                 synchronized(this.node) {
                     if(!Async.isReady((CompletableFuture<?>)this.node.getValue())) {
-                        // 如果真的没算完，就把所有的时间暂时设为超大值，真正的时间值会在handleCompletion方法里填充
+                        // 如果真的没算完，就把所有的时间暂时设为超大值，真正的时间值会在UpdateTask里填充
                         long expirationTime = expirationTicker().read() + Async.ASYNC_EXPIRY;
                         setVariableTime(node, expirationTime);
                         setAccessTime(node, expirationTime);
