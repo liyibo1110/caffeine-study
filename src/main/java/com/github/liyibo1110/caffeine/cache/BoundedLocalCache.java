@@ -2,11 +2,13 @@ package com.github.liyibo1110.caffeine.cache;
 
 import com.github.liyibo1110.caffeine.cache.stats.StatsCounter;
 
+import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.util.AbstractMap;
 import java.util.Collection;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
@@ -14,6 +16,7 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.logging.Level;
@@ -932,6 +935,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
         boolean delayable = this.skipReadBuffer() || this.readBuffer.offer(node) != Buffer.FULL;
         if(this.shouldDrainBuffers(delayable))
             this.scheduleDrainBuffers();
+        // 尝试提前重新加载
         this.refreshIfNeeded(node, now);
     }
 
@@ -946,14 +950,206 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
      * 如果符合条件，则异步刷新Node
      */
     void refreshIfNeeded(Node<K, V> node, long now) {
+        if(!this.refreshAfterWrite())
+            return;
+        K key;
+        V oldValue;
+        long oldWriteTime = node.getWriteTime();
+        long refreshWriteTime = now + Async.ASYNC_EXPIRY;
+        if((now - oldWriteTime) > this.refreshAfterWriteNanos()
+            && ((key = node.getKey()) != null && ((oldValue = node.getValue()) != null))
+            && node.casWriteTime(oldWriteTime, refreshWriteTime)) { // 用一个极大值来占坑，保证其它线程不会再进入if里面
+            try {
+                CompletableFuture<V> refreshFuture;
+                long startTime = this.statsTicker().read();
+                if(this.isAsync) {
+                    CompletableFuture<V> future = (CompletableFuture<V>)oldValue;
+                    if(Async.isReady(future)) {
+                        CompletableFuture<V> refresh = future.thenCompose(value ->
+                                this.cacheLoader.asyncReload(key, value, this.executor));
+                        refreshFuture = refresh;
+                    }else {
+                        // 如果本身oldValue就没算好，把writeTime写回原样
+                        node.casWriteTime(refreshWriteTime, oldWriteTime);
+                        return;
+                    }
+                }else {
+                    CompletableFuture<V> refresh = this.cacheLoader.asyncReload(key, oldValue, this.executor);
+                    refreshFuture = refresh;
+                }
 
+                refreshFuture.whenComplete((newValue, error) -> {
+                    long loadTime = this.statsTicker().read() - startTime;
+                    if(error != null) { // 出错了就还原回去完事
+                        if(!(error instanceof CancellationException) && !(error instanceof TimeoutException))
+                            logger.log(Level.WARNING, "Exception thrown during refresh", error);
+                        node.casWriteTime(refreshWriteTime, oldWriteTime);
+                        statsCounter().recordLoadFailure(loadTime);
+                        return;
+                    }
+
+                    V value = (this.isAsync && newValue != null) ? (V)refreshFuture : newValue;
+                    // 成功load出新value了，开始替换
+                    boolean[] discard = new boolean[1];
+                    this.compute(key, (k, currentValue) -> {
+                        if(currentValue == null)
+                            return value;
+                        else if(currentValue == oldValue && node.getWriteTime() == refreshWriteTime)   // 没有被其它线程改了
+                            return value;
+                        // 到这里说明不满足上面的条件，就算失败，不做更新
+                        discard[0] = true;
+                        return currentValue;
+                    }, false, false, true);
+
+                    if(discard[0] && this.hasRemovalListener())
+                        this.notifyRemoval(key, value, RemovalCause.REPLACED);
+                    if(newValue == null)
+                        this.statsCounter().recordLoadFailure(loadTime);
+                    else
+                        this.statsCounter().recordLoadSuccess(loadTime);
+                });
+            } catch (Throwable t) {
+                node.casWriteTime(refreshWriteTime, oldWriteTime);
+                logger.log(Level.SEVERE, "Exception thrown when submitting refresh task", t);
+            }
+        }
     }
 
     /**
-     * 尝试调度一个异步任务来清理buffer
+     * 返回node创建后的过期时间（即构建cache时自定义了Expiry实例，用这个方法来返回到期时间）
+     */
+    long expireAfterCreate(K key, V value, Expiry<K, V> expiry, long now) {
+        if(this.expiresVariable() && key != null && value != null) {
+            long duration = expiry.expireAfterCreate(key, value, now);  // 即用户自己实现的方法
+            return this.isAsync ? now + duration : now + Math.min(duration, MAXIMUM_EXPIRY);
+        }
+        return 0L;
+    }
+
+    /**
+     * 返回node被更新后的过期时间（即构建cache时自定义了Expiry实例，用这个方法来返回到期时间）
+     */
+    long expireAfterUpdate(Node<K, V> node, K key, V value, Expiry<K, V> expiry, long now) {
+        if(this.expiresVariable() && key != null && value != null) {
+            long currentDuration = Math.max(1, node.getVariableTime() - now);
+            long duration = expiry.expireAfterUpdate(key, value, now, currentDuration);
+            return this.isAsync ? now + duration : now + Math.min(duration, MAXIMUM_EXPIRY);
+        }
+        return 0L;
+    }
+
+    /**
+     * 返回node被访问后的过期时间（即构建cache时自定义了Expiry实例，用这个方法来返回到期时间）
+     */
+    long expireAfterRead(Node<K, V> node, K key, V value, Expiry<K, V> expiry, long now) {
+        if(this.expiresVariable() && key != null && value != null) {
+            long currentDuration = Math.max(1, node.getVariableTime() - now);
+            long duration = expiry.expireAfterRead(key, value, now, currentDuration);
+            return this.isAsync ? now + duration : now + Math.min(duration, MAXIMUM_EXPIRY);
+        }
+        return 0L;
+    }
+
+    /**
+     * 在访问后尝试更新node的过期时间（构建cache时自定义了Expiry实例才会有用）
+     */
+    void tryExpireAfterRead(Node<K, V> node, K key, V value, Expiry<K, V> expiry, long now) {
+        if(!this.expiresVariable() || key == null || value == null)
+            return;
+
+        long variableTime = node.getVariableTime();
+        // 算出的是相对过期长度，因为variableTime是一个绝对时间点，不是时间段
+        long currentDuration = Math.max(1, variableTime - now);
+        if(this.isAsync && currentDuration > MAXIMUM_EXPIRY)
+            return;
+
+        // 调用用户自定义的实现，计算出新的时间段
+        long duration = expiry.expireAfterRead(key, value, now, currentDuration);
+        if(duration != currentDuration) {   // 不一样则说明要更新
+            long expirationTime = this.isAsync ? now + duration : now + Math.min(duration, MAXIMUM_EXPIRY);
+            node.casVariableTime(variableTime, expirationTime);
+        }
+    }
+
+    void setVariableTime(Node<K, V> node, long expirationTime) {
+        if(this.expiresVariable())
+            node.setVariableTime(expirationTime);
+    }
+
+    void setWriteTime(Node<K, V> node, long now) {
+        if(this.expiresAfterWrite() || this.refreshAfterWrite())
+            node.setWriteTime(now);
+    }
+
+    void setAccessTime(Node<K, V> node, long now) {
+        if(this.expiresAfterAccess())
+            node.setAccessTime(now);
+    }
+
+    /**
+     * 对cache进行写入操作后，要做的事情
+     */
+    void afterWrite(Runnable task) {
+        for(int i = 0; i < WRITE_BUFFER_RETRIES; i++) {
+            // 先优先尝试将task传给writeBuffer，让它来执行，成功说明消费者可以正常消费
+            if(this.writeBuffer.offer(task)) {
+                this.scheduleAfterWrite();
+                return;
+            }
+            this.scheduleDrainBuffers();    // 这一步相当于催促消费者尽快消费
+        }
+
+        // 尝试了100次，也没有将task写入writeBuffer，只能自己来了
+        try {
+            this.performCleanUp(task);
+        } catch (RuntimeException e) {
+            logger.log(Level.SEVERE, "Exception thrown when performing the maintenance task", e);
+        }
+    }
+
+    void scheduleAfterWrite() {
+        while(true) {
+            switch(this.drainStatus()) {
+                case IDLE:  // 没有在运行maintenance，立刻开始调度
+                    this.casDrainStatus(IDLE, REQUIRED);
+                    this.scheduleDrainBuffers();
+                    return;
+                case REQUIRED:
+                    this.scheduleDrainBuffers();
+                    return;
+                case PROCESSING_TO_IDLE:    // maintenance已有调度，完事要再运行一次
+                    if(this.casDrainStatus(PROCESSING_TO_IDLE, PROCESSING_TO_REQUIRED))
+                        return;
+                    continue;
+                case PROCESSING_TO_REQUIRED:
+                    return;
+                default:
+                    throw new IllegalStateException();
+            }
+        }
+    }
+
+    /**
+     * 尝试调度一个异步任务来清理buffer，即启动drainBuffersTask
      */
     void scheduleDrainBuffers() {
-
+        // 正在排就直接结束
+        if(this.drainStatus() >= PROCESSING_TO_IDLE)
+            return;
+        if(this.evictionLock.tryLock()) {
+            try {
+                int drainStatus = this.drainStatus();
+                if(drainStatus >= PROCESSING_TO_IDLE)
+                    return;
+                this.lazySetDrainStatus(PROCESSING_TO_IDLE);
+                this.executor.execute(this.drainBuffersTask);
+            } catch (Throwable t) {
+                logger.log(Level.WARNING, "Exception thrown when submitting maintenance task", t);
+                maintenance(null);
+            } finally {
+                this.evictionLock.unlock();
+            }
+        }
     }
 
     @Override
@@ -981,14 +1177,116 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
     }
 
     void maintenance(Runnable task) {
+        this.lazySetDrainStatus(PROCESSING_TO_IDLE);
+        try {
+            this.drainReadBuffer();
+            this.drainWriteBuffer();
+            if(task != null)
+                task.run();
+            this.drainKeyReferences();
+            this.drainValueReferences();
+            this.expireEntries();
+            this.evictEntries();
+            this.climb();
+        } finally {
+            if(this.drainStatus() != PROCESSING_TO_IDLE || !this.casDrainStatus(PROCESSING_TO_IDLE, IDLE))
+                this.lazySetDrainStatus(REQUIRED);
+        }
+    }
 
+    /**
+     * 清理weak key引用队列
+     */
+    void drainKeyReferences() {
+        if(!this.collectKeys())
+            return;
+        Reference<? extends K> keyRef;
+        while((keyRef = this.keyReferenceQueue().poll()) != null) {
+            Node<K, V> node = this.data.get(keyRef);
+            if(node != null)
+                this.evictEntry(node, RemovalCause.COLLECTED, 0L);
+        }
+    }
+
+    void drainValueReferences() {
+        if(!this.collectValues())
+            return;
+
+        Reference<? extends V> valueRef;
+        while((valueRef = this.valueReferenceQueue().poll()) != null) {
+            @SuppressWarnings("unchecked")
+            References.InternalReference<V> ref = (References.InternalReference<V>)valueRef;
+            Node<K, V> node = this.data.get(ref.getKeyReference());
+            if(node != null && valueRef == node.getValueReference())
+                this.evictEntry(node, RemovalCause.COLLECTED, 0L);
+        }
+    }
+
+    /**
+     * 清理read buffer
+     */
+    void drainReadBuffer() {
+        if(!this.skipReadBuffer())
+            this.readBuffer.drainTo(this.accessPolicy);
     }
 
     /**
      * 尝试更新Node的内部类型
      */
     void onAccess(Node<K, V> node) {
+        if(this.evicts()) { // 完整的cache策略路径
+            K key = node.getKey();
+            if(key == null)
+                return;
+            this.frequencySketch().increment(key);  // read事件说明命中了，需要统计
+            if(node.inWindow())
+                reorder(this.accessOrderWindowDeque(), node);
+            else if(node.inMainProbation())
+                this.reorderProbation(node);
+            else
+                reorder(this.accessOrderProtectedDeque(), node);
+            this.setHitsInSample(this.hitsInSample() + 1);
+        }else if(this.expiresAfterAccess()) {   // 没有清理策略，只检查有没有过期策略
+            reorder(this.accessOrderWindowDeque(), node);
+        }
+        if(this.expiresVariable())
+            this.timerWheel().reschedule(node);
+    }
 
+    /**
+     * node被命中，尝试probation -> protected
+     */
+    void reorderProbation(Node<K, V> node) {
+        if(!this.accessOrderProbationDeque().contains(node))    // 不在probation queue
+            return;
+        else if(node.getPolicyWeight() > this.mainProtectedMaximum())
+            return;
+        // probation -> protected
+        this.setMainProtectedWeightedSize(this.mainProtectedWeightedSize() + node.getPolicyWeight());
+        this.accessOrderProbationDeque().remove(node);
+        this.accessOrderProtectedDeque().add(node);
+        node.makeMainProtected();
+    }
+
+    /**
+     * 将deque里面指定的node移动到队列尾（last）
+     */
+    static <K, V> void reorder(LinkedDeque<Node<K, V>> deque, Node<K, V> node) {
+        if(deque.contains(node))
+            deque.moveToBack(node);
+    }
+
+    void drainWriteBuffer() {
+        // 尽力执行writeBuffer里面的Runnable（即真正的写后逻辑），每轮maintenance只会处理一部分
+        for(int i = 0; i <= WRITE_BUFFER_MAX ; i++) {
+            // writeBuffer里面的Runnable，和readBuffer不同，属于强一致，可以不一次性完成，但要保证“最终完成”，
+            Runnable task = this.writeBuffer.poll();
+            if(task == null)    // 都处理完了则返回
+                return;
+            task.run();
+        }
+        // 到这里说明writeBuffer仍然有Runnable尚未执行，需要标记drain状态为“还要再次清理”
+        this.lazySetDrainStatus(PROCESSING_TO_REQUIRED);
     }
 
     /**
@@ -1009,6 +1307,91 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
         }
     }
 
+    /**
+     * cache add操作后的后处理
+     */
+    final class AddTask implements Runnable {
+        final Node<K, V> node;
+        final int weight;
+
+        AddTask(Node<K, V> node, int weight) {
+            this.weight = weight;
+            this.node = node;
+        }
+
+        @Override
+        public void run() {
+            if(evicts()) {
+                long weightedSize = weightedSize();
+                setWeightedSize(weightedSize + this.weight);
+                setWindowWeightedSize(windowWeightedSize() + this.weight);  // 新来的会是window状态
+                this.node.setPolicyWeight(this.node.getPolicyWeight() + this.weight);
+
+                long maximum = maximum();
+                // 接近maximum时，才会初始化FrequencySketch（懒初始化）
+                if(weightedSize >= (maximum >>> 1)) {   // 超过maximum的一半
+                    // isWeighted为false，说明每个Node的weight值固定为1
+                    long capacity = isWeighted() ? data.mappingCount() : maximum;
+                    frequencySketch().ensureCapacity(capacity);
+                }
+
+                K key = this.node.getKey();
+                if(key != null)
+                    frequencySketch().increment(key);
+                setMissesInSample(missesInSample() + 1);    // add了说明之前没有命中cache
+            }
+
+            boolean isAlive;
+            synchronized(this.node) {
+                isAlive = this.node.isAlive();
+            }
+            if(isAlive) {
+                if(expiresAfterWrite())
+                    writeOrderDeque().add(this.node);
+                if(evicts() && this.weight > windowMaximum())   // 如果node的weight太大了，直接放到window的最冷位置（尽快驱逐）
+                    accessOrderWindowDeque().offerFirst(this.node);
+                else if(evicts() || expiresAfterAccess())   // 正常放到window最热
+                    accessOrderWindowDeque().offerLast(node);
+
+                if(expiresVariable())
+                    timerWheel().schedule(this.node);
+            }
+
+            if(isComputingAsync(this.node)) {   // 如果时async模式，并且value还没计算完
+                synchronized(this.node) {
+                    if(!Async.isReady((CompletableFuture<?>)this.node.getValue())) {
+                        // 如果真的没算完，就把所有的时间暂时设为超大值，真正的时间值会在handleCompletion方法里填充
+                        long expirationTime = expirationTicker().read() + Async.ASYNC_EXPIRY;
+                        setVariableTime(node, expirationTime);
+                        setAccessTime(node, expirationTime);
+                        setWriteTime(node, expirationTime);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * cache remove操作后的后处理
+     */
+    final class RemovalTask implements Runnable {
+
+        @Override
+        public void run() {
+
+        }
+    }
+
+    /**
+     * cache update操作后的后处理
+     */
+    final class UpdateTask implements Runnable {
+
+        @Override
+        public void run() {
+
+        }
+    }
 
     static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
         private static final long serialVersionUID = 1L;

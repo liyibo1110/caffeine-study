@@ -6,6 +6,7 @@ package com.github.liyibo1110.caffeine.cache;
  * 本身是一个准入/淘汰策略的记忆体，用小内存来估算：某个key最近一段时间被访问的有多频繁，给W-TinyLFU做决策用。
  * cache的驱逐策略是：维护一个“最近窗口”的近似访问频率统计，
  * 每个key有一个计数器，最多统计到15，统计到一定量后会把所有计数衰减一半，让旧热点慢慢淡出
+ * 注意这个是按照key来统计频率，不是按照Node的weight
  * @author liyibo
  * @date 2026-01-15 17:08
  */
