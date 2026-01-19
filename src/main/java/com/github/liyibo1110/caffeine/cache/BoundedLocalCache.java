@@ -1,12 +1,18 @@
 package com.github.liyibo1110.caffeine.cache;
 
 import com.github.liyibo1110.caffeine.cache.stats.StatsCounter;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.util.AbstractMap;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -21,6 +27,8 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import static java.util.Objects.requireNonNull;
 
 /**
  * @author liyibo
@@ -1231,7 +1239,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
     }
 
     /**
-     * 尝试更新Node的内部类型
+     * node在被访问之后的后处理逻辑
      */
     void onAccess(Node<K, V> node) {
         if(this.evicts()) { // 完整的cache策略路径
@@ -1375,10 +1383,27 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
      * cache remove操作后的后处理
      */
     final class RemovalTask implements Runnable {
+        final Node<K, V> node;
+
+        RemovalTask(Node<K, V> node) {
+            this.node = node;
+        }
 
         @Override
         public void run() {
-
+            if(this.node.inWindow() && (evicts() || expiresAfterAccess())) {
+                accessOrderWindowDeque().remove(this.node);
+            }else if(evicts()) {
+                if(this.node.inMainProbation())
+                    accessOrderProbationDeque().remove(this.node);
+                else
+                    accessOrderProtectedDeque().remove(this.node);
+            }
+            if(expiresAfterWrite())
+                writeOrderDeque().remove(this.node);
+            else if(expiresVariable())
+                timerWheel().deschedule(this.node);
+            makeDead(this.node);
         }
     }
 
@@ -1386,11 +1411,556 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
      * cache update操作后的后处理
      */
     final class UpdateTask implements Runnable {
+        final Node<K, V> node;
+        final int weightDifference; // weight的增量
+
+        public UpdateTask(Node<K, V> node, int weightDifference) {
+            this.node = node;
+            this.weightDifference = weightDifference;
+        }
 
         @Override
         public void run() {
+            if(evicts()) {
+                int oldWeightedSize = this.node.getPolicyWeight();
+                this.node.setPolicyWeight(oldWeightedSize + this.weightDifference);
+                if(this.node.inWindow()) {
+                    if(this.node.getPolicyWeight() <= windowMaximum())
+                        onAccess(this.node);
+                    else if(accessOrderWindowDeque().contains(this.node)) // node的weight太大了，挪到front等下一轮eviction再处理
+                        accessOrderWindowDeque().moveToFront(this.node);
+                    setWindowWeightedSize(windowWeightedSize() + this.weightDifference);
+                }else if(this.node.inMainProbation()) {
+                    if(this.node.getPolicyWeight() <= maximum())
+                        onAccess(this.node);
+                    else if(accessOrderProbationDeque().remove(this.node)) { // node的weight太大了，只能挪回window里
+                        accessOrderWindowDeque().addFirst(this.node);
+                        setWindowWeightedSize(windowWeightedSize() + this.node.getPolicyWeight());
+                    }
+                }else if(this.node.inMainProtected()) {
+                    if(this.node.getPolicyWeight() <= maximum()) {
+                        onAccess(this.node);
+                        setMainProtectedWeightedSize(mainProtectedWeightedSize() + this.weightDifference);
+                    }else if(accessOrderProtectedDeque().remove(this.node)) { // node的weight太大了，只能挪回window里
+                        accessOrderWindowDeque().addFirst(this.node);
+                        setWindowWeightedSize(windowWeightedSize() + this.node.getPolicyWeight());
+                        setMainProtectedWeightedSize(mainProtectedWeightedSize() - oldWeightedSize);
+                    }else {
+                        setMainProtectedWeightedSize(mainProtectedWeightedSize() - oldWeightedSize);
+                    }
+                }
+                setWeightedSize(weightedSize() + this.weightDifference);
+            }else if(expiresAfterAccess()) {    // 没有清理策略，则按照read后处理
+                onAccess(this.node);
+            }
 
+            if(expiresAfterWrite())
+                reorder(writeOrderDeque(), this.node);  // 调整在writeOrderDeque里面的顺序
+            else if(expiresVariable())
+                timerWheel().reschedule(this.node);
         }
+    }
+
+    /* --------------- Concurrent Map Support相关实现 --------------- */
+
+    @Override
+    public boolean isEmpty() {
+        return this.data.isEmpty();
+    }
+
+    @Override
+    public int size() {
+        return this.data.size();
+    }
+
+    @Override
+    public long estimatedSize() {
+        return this.data.mappingCount();
+    }
+
+    @Override
+    public void clear() {
+        this.evictionLock.lock();
+        try {
+            long now = this.expirationTicker().read();
+            // 运行所有的写后处理
+            Runnable task;
+            while((task = this.writeBuffer.poll()) != null)
+                task.run();
+
+            // 移除所有的node
+            for(Node<K, V> node : this.data.values())
+                this.removeNode(node, now);
+
+            // 取消cleanup的调度
+            Pacer pacer = this.pacer();
+            if(pacer != null)
+                pacer.cancel();
+
+            // 丢弃所有readBuffer内容
+            this.readBuffer.drainTo(e -> {});
+        } finally {
+            this.evictionLock.unlock();
+        }
+    }
+
+    /**
+     * 移除单个node
+     */
+    void removeNode(Node<K, V> node, long now) {
+        K key = node.getKey();
+        V[] value = (V[])new Object[1];
+        RemovalCause[] cause = new RemovalCause[1];
+
+        this.data.computeIfPresent(node.getKeyReference(), (k, n) -> {
+            if(n != node)
+                return n;
+            synchronized(n) {
+                value[0] = n.getValue();
+                if(key == null || value[0] == null)
+                    cause[0] = RemovalCause.COLLECTED;
+                else if(this.hasExpired(n, now))
+                    cause[0] = RemovalCause.EXPIRED;
+                else
+                    cause[0] = RemovalCause.EXPLICIT;
+
+                if(key != null)
+                    this.writer.delete(key, value[0], cause[0]);
+                this.makeDead(n);
+                return null;
+            }
+        });
+
+        if(node.inWindow() && (this.evicts() || this.expiresAfterAccess())) {
+            this.accessOrderWindowDeque().remove(node);
+        }else if(this.evicts()) {
+            if(node.inMainProbation())
+                this.accessOrderProbationDeque().remove(node);
+            else
+                this.accessOrderProtectedDeque().remove(node);
+        }
+        if(this.expiresAfterWrite())
+            this.writeOrderDeque().remove(node);
+        else if(this.expiresVariable())
+            this.timerWheel().deschedule(node);
+
+        if(cause[0] != null && this.hasRemovalListener())
+            this.notifyRemoval(key, value[0], cause[0]);
+    }
+
+    @Override
+    public boolean containsKey(Object key) {
+        Node<K, V> node = this.data.get(this.nodeFactory.newLookupKey(key));
+        return node != null && node.getValue() != null && !this.hasExpired(node, this.expirationTicker().read());
+    }
+
+    @Override
+    public boolean containsValue(Object value) {
+        Objects.requireNonNull(value);
+        long now = this.expirationTicker().read();
+        for(Node<K, V> node : this.data.values()) {
+            if(node.containsValue(value) && !this.hasExpired(node, now) && node.getKey() != null)
+                return true;
+        }
+        return false;
+    }
+
+    @Override
+    public V get(Object key) {
+        return this.getIfPresent(key, false);
+    }
+
+    @Override
+    public V getIfPresent(Object key, boolean recordStats) {
+        Node<K, V> node = this.data.get(this.nodeFactory.newLookupKey(key));
+        if(node == null) {
+            if(recordStats)
+                this.statsCounter().recordMisses(1);
+            if(this.drainStatus() == REQUIRED)  // 如果没有跑清理，顺便触发跑一下，和node为null其实关系不大
+                this.scheduleDrainBuffers();
+            return null;
+        }
+
+        V value = node.getValue();
+        long now = expirationTicker().read();
+        if(this.hasExpired(node, now) || (this.collectValues() && value == null)) {
+            if(recordStats)
+                this.statsCounter().recordMisses(1);
+            this.scheduleDrainBuffers();    // 直接触发，因为node已过期，或者已被GC
+            return null;
+        }
+
+        if(!this.isComputingAsync(node)) {
+            // value已取出，并且可以返回了
+            K castedKey = (K)key;
+            this.setAccessTime(node, now);
+            this.tryExpireAfterRead(node, castedKey, value, this.expiry(), now);
+        }
+        this.afterRead(node, now, recordStats);
+        return value;
+    }
+
+    @Override
+    public @Nullable V getIfPresentQuietly(Object key, long[] writeTime) {
+        V value;
+        Node<K, V> node = this.data.get(this.nodeFactory.newLookupKey(key));
+        if(node == null || (value = node.getValue()) == null || this.hasExpired(node, this.expirationTicker().read()))
+            return null;
+        writeTime[0] = node.getWriteTime();
+        return value;
+    }
+
+    @Override
+    public Map<K, V> getAllPresent(Iterable<?> keys) {
+        Set<Object> uniqueKeys = new LinkedHashSet<>();
+        for(Object key : keys)
+            uniqueKeys.add(key);
+
+        int misses = 0;
+        long now = expirationTicker().read();
+        Map<Object, Object> result = new LinkedHashMap<>(uniqueKeys.size());
+        for(Object key : uniqueKeys) {
+            V value;
+            Node<K, V> node = this.data.get(this.nodeFactory.newLookupKey(key));
+            if(node == null || (value = node.getValue()) == null | this.hasExpired(node, now)) {
+                misses++;
+            }else {
+                result.put(key, value);
+                if(!this.isComputingAsync(node)) {
+                    K castedKey = (K)key;
+                    this.tryExpireAfterRead(node, castedKey, value, expiry(), now);
+                    this.setAccessTime(node, now);
+                }
+                this.afterRead(node, now, /* recordHit */ false);
+            }
+        }
+        this.statsCounter().recordMisses(misses);
+        this.statsCounter().recordHits(result.size());
+        Map<K, V> castedResult = (Map<K, V>)result;
+        return Collections.unmodifiableMap(castedResult);
+    }
+
+    @Override
+    public @Nullable V put(K key, V value) {
+        return this.put(key, value, this.expiry(), true, false);
+    }
+
+    @Override
+    public @Nullable V put(K key, V value, boolean notifyWriter) {
+        return this.put(key, value, expiry(), notifyWriter, false);
+    }
+
+    @Override
+    public @Nullable V putIfAbsent(K key, V value) {
+        return this.put(key, value, expiry(), true, true);
+    }
+
+    V put(K key, V value, Expiry<K, V> expiry, boolean notifyWriter, boolean onlyIfAbsent) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(value);
+
+        Node<K, V> node = null;
+        long now = expirationTicker().read();
+        int newWeight = this.weigher.weigh(key, value);
+        while (true) {
+            Node<K, V> prior = this.data.get(this.nodeFactory.newLookupKey(key));
+            if (prior == null) { // key还不存在
+                if (node == null) {
+                    node = this.nodeFactory.newNode(key, this.keyReferenceQueue(),
+                            value, this.valueReferenceQueue(), newWeight, now);
+                    this.setVariableTime(node, this.expireAfterCreate(key, value, expiry, now));
+                }
+                if (notifyWriter && this.hasWriter()) {
+                    Node<K, V> computed = node;
+                    prior = this.data.computeIfAbsent(node.getKeyReference(), k -> {
+                        this.writer.write(key, value);
+                        return computed;
+                    });
+                    if (prior == node) { // 说明上面computeIfAbsent确实将新的node写入了
+                        this.afterWrite(new AddTask(node, newWeight));
+                        return null;
+                    } else if (onlyIfAbsent) {
+                        V currentValue = prior.getValue();
+                        if (currentValue != null && !this.hasExpired(prior, now)) {
+                            if (!this.isComputingAsync(prior)) {
+                                this.tryExpireAfterRead(prior, key, currentValue, expiry(), now);
+                                this.setAccessTime(prior, now);
+                            }
+                            this.afterRead(prior, now, false);
+                            return currentValue;    // 方法结束并返回
+                        }
+                    }
+                } else {
+                    prior = this.data.putIfAbsent(node.getKeyReference(), node);
+                    if (prior == null) { // 进了这里说明node成功put了，整个方法可以直接返回
+                        this.afterWrite(new AddTask(node, newWeight));
+                        return null;
+                    } else if (onlyIfAbsent) {    // 说明key对应里面有node，开启了onlyIfAbsent则要保留旧值
+                        V currentValue = prior.getValue();
+                        if (currentValue != null && !this.hasExpired(prior, now)) {
+                            if (!this.isComputingAsync(prior)) {
+                                this.tryExpireAfterRead(prior, key, currentValue, expiry(), now);
+                                this.setAccessTime(prior, now);
+                            }
+                            this.afterRead(prior, now, false);
+                            return currentValue;    // 方法结束并返回
+                        }
+                    }
+                }
+            } else if (onlyIfAbsent) {    // 如果key已存在（即prior不为null），同时开启了onlyIfAbsent
+                V currentValue = prior.getValue();
+                if (currentValue != null && !this.hasExpired(prior, now)) {
+                    if (!this.isComputingAsync(prior)) {
+                        this.tryExpireAfterRead(prior, key, currentValue, expiry(), now);
+                        this.setAccessTime(prior, now);
+                    }
+                    this.afterRead(prior, now, false);
+                    return currentValue;    // 方法结束并返回
+                }
+            }
+
+            // 如果key已经有对应value在里面，但是值为null或者有值但过期，继续下面的逻辑
+            V oldValue;
+            long varTime;
+            int oldWeight;
+            boolean expired = false;
+            boolean mayUpdate = true;   // 这次put算不算update操作
+            boolean exceedsTolerance = false;   // 是否值得做一次维护（即新node带来了过期时间是否足够大）
+            synchronized (prior) {
+                if (!prior.isAlive())
+                    continue;
+                oldValue = prior.getValue();
+                oldWeight = prior.getWeight();
+                if (oldValue == null) {  // 已被GC
+                    varTime = this.expireAfterCreate(key, value, expiry, now);  // 刷新过期时间
+                    this.writer.delete(key, null, RemovalCause.COLLECTED);
+                } else if (this.hasExpired(prior, now)) {
+                    expired = true;
+                    varTime = this.expireAfterCreate(key, value, expiry, now);  // 刷新过期时间
+                    this.writer.delete(key, oldValue, RemovalCause.EXPIRED);
+                } else if (onlyIfAbsent) {
+                    mayUpdate = false;
+                    varTime = this.expireAfterRead(prior, key, value, expiry, now); // 刷新过期时间
+                } else {
+                    varTime = this.expireAfterUpdate(prior, key, value, expiry, now);   // 刷新过期时间
+                }
+
+                if (notifyWriter && (expired || (mayUpdate && (value != oldValue)))) {
+                    this.writer.write(key, value);
+                    if (mayUpdate) {
+                        exceedsTolerance =
+                                (expiresAfterWrite() && (now - prior.getWriteTime()) > EXPIRE_WRITE_TOLERANCE)
+                                        || (expiresVariable() && Math.abs(varTime - prior.getVariableTime()) > EXPIRE_WRITE_TOLERANCE);
+
+                        this.setWriteTime(prior, now);
+                        prior.setWeight(newWeight);
+                        prior.setValue(value, this.valueReferenceQueue());
+                    }
+
+                    this.setVariableTime(prior, varTime);
+                    this.setAccessTime(prior, now);
+                }
+
+                if(this.hasRemovalListener()) {
+                    if(expired)
+                        this.notifyRemoval(key, oldValue, RemovalCause.EXPIRED);
+                    else if(oldValue == null)
+                        this.notifyRemoval(key, null, RemovalCause.COLLECTED);
+                    else if(mayUpdate && (value != oldValue))
+                        this.notifyRemoval(key, oldValue, RemovalCause.REPLACED);
+                }
+
+                int weightedDifference = mayUpdate ? (newWeight - oldWeight) : 0;
+                if(oldValue == null || weightedDifference != 0 || expired)
+                    this.afterWrite(new UpdateTask(prior, weightedDifference));
+                else if(!onlyIfAbsent && exceedsTolerance)
+                    this.afterWrite(new UpdateTask(prior, weightedDifference));
+                else{
+                    if(mayUpdate)
+                        this.setWriteTime(prior, now);
+                    this.afterRead(prior, now, false);
+                }
+                return expired ? null : oldValue;
+            }
+        }
+    }
+
+    public V remove(Object key) {
+        K castedKey = (K)key;
+        Node<K, V>[] node = new Node[1];
+        V[] oldValue = (V[])new Object[1];
+        RemovalCause[] cause = new RemovalCause[1];
+
+        // 并没有真的remove，只是把value设为null了
+        this.data.computeIfPresent(this.nodeFactory.newLookupKey(key), (k, n) -> {
+            synchronized(n) {
+                oldValue[0] = n.getValue();
+                if(oldValue[0] == null)
+                    cause[0] = RemovalCause.COLLECTED;
+                else if(this.hasExpired(n, this.expirationTicker().read()))
+                    cause[0] = RemovalCause.EXPIRED;
+                else
+                    cause[0] = RemovalCause.EXPLICIT;
+
+                writer.delete(castedKey, oldValue[0], cause[0]);
+                n.retire();
+            }
+            node[0] = n;
+            return null;
+        });
+
+        if(cause[0] != null) {
+            this.afterWrite(new RemovalTask(node[0]));
+            if(this.hasRemovalListener())
+                this.notifyRemoval(castedKey, oldValue[0], cause[0]);
+        }
+        return cause[0] == RemovalCause.EXPLICIT ? oldValue[0] : null;
+    }
+
+    @Override
+    public boolean remove(Object key, Object value) {
+        Objects.requireNonNull(key);
+        if(value == null)
+            return false;
+
+        Node<K, V>[] removed = new Node[1];
+        K[] oldKey = (K[])new Object[1];
+        V[] oldValue = (V[])new Object[1];
+        RemovalCause[] cause = new RemovalCause[1];
+
+        this.data.computeIfPresent(this.nodeFactory.newLookupKey(key), (kR, node) -> {
+            synchronized(node) {
+                oldKey[0] = node.getKey();
+                oldValue[0] = node.getValue();
+                if(oldKey[0] == null)
+                    cause[0] = RemovalCause.COLLECTED;
+                else if(this.hasExpired(node, this.expirationTicker().read()))
+                    cause[0] = RemovalCause.EXPIRED;
+                else if(node.containsValue(value))
+                    cause[0] = RemovalCause.EXPLICIT;
+                else
+                    return node;    // 保持不变
+
+                this.writer.delete(oldKey[0], oldValue[0], cause[0]);
+                removed[0] = node;
+                node.retire();
+                return null;
+            }
+        });
+
+        if(removed[0] == null)
+            return false;
+        else if(this.hasRemovalListener())
+            this.notifyRemoval(oldKey[0], oldValue[0], cause[0]);
+
+        this.afterWrite(new RemovalTask(removed[0]));
+        return cause[0] == RemovalCause.EXPLICIT;
+    }
+
+    @Override
+    public V replace(K key, V value) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(value);
+
+        int[] oldWeight = new int[1];
+        K[] nodeKey = (K[])new Object[1];
+        V[] oldValue = (V[])new Object[1];
+        long[] now = new long[1];
+        int weight = weigher.weigh(key, value);
+
+        Node<K, V> node = data.computeIfPresent(nodeFactory.newLookupKey(key), (k, n) -> {
+            synchronized(n) {
+                nodeKey[0] = n.getKey();
+                oldValue[0] = n.getValue();
+                oldWeight[0] = n.getWeight();
+                if(nodeKey[0] == null || oldValue[0] == null
+                        || this.hasExpired(n, now[0] = this.expirationTicker().read())) {
+                    // 如果key不存在，或者value不存在或已过期，则说明replace条件不成立
+                    oldValue[0] = null;
+                    return n;
+                }
+
+                long varTime = this.expireAfterUpdate(n, key, value, this.expiry(), now[0]);
+                if(value != oldValue[0])
+                    this.writer.write(nodeKey[0], value);
+
+                // 注意是直接替换value，而不是return value
+                n.setValue(value, this.valueReferenceQueue());
+                n.setWeight(weight);
+
+                this.setVariableTime(n, varTime);
+                this.setAccessTime(n, now[0]);
+                this.setWriteTime(n, now[0]);
+                return n;
+            }
+        });
+
+        if(oldValue[0] == null) // 说明replace条件不成立
+            return null;
+
+        int weightedDifference = weight - oldWeight[0];
+        if(this.expiresAfterWrite() || weightedDifference != 0)
+            this.afterWrite(new UpdateTask(node, weightedDifference));
+        else
+            this.afterRead(node, now[0], false);
+
+        if(this.hasRemovalListener() && value != oldValue[0])
+            this.notifyRemoval(nodeKey[0], oldValue[0], RemovalCause.REPLACED);
+
+        return oldValue[0]; // 返回旧值
+    }
+
+    @Override
+    public boolean replace(K key, V oldValue, V newValue) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(oldValue);
+        Objects.requireNonNull(newValue);
+
+        int weight = weigher.weigh(key, newValue);
+        boolean[] replaced = new boolean[1];
+        K[] nodeKey = (K[])new Object[1];
+        V[] prevValue = (V[])new Object[1];
+        int[] oldWeight = new int[1];
+        long[] now = new long[1];
+
+        Node<K, V> node = data.computeIfPresent(nodeFactory.newLookupKey(key), (k, n) -> {
+            synchronized (n) {
+                nodeKey[0] = n.getKey();
+                prevValue[0] = n.getValue();
+                oldWeight[0] = n.getWeight();
+                if(nodeKey[0] == null || prevValue[0] == null || !n.containsValue(oldValue)
+                        || this.hasExpired(n, now[0] = this.expirationTicker().read())) {
+                    // 如果key不存在，或者value不存在或已过期，则说明replace条件不成立
+                    return n;
+                }
+
+                long varTime = this.expireAfterUpdate(n, key, newValue, expiry(), now[0]);
+                if(newValue != prevValue[0])
+                    this.writer.write(key, newValue);
+                n.setValue(newValue, this.valueReferenceQueue());
+                n.setWeight(weight);
+
+                this.setVariableTime(n, varTime);
+                this.setAccessTime(n, now[0]);
+                this.setWriteTime(n, now[0]);
+                replaced[0] = true;
+            }
+            return n;
+        });
+
+        if(!replaced[0])
+            return false;
+
+        int weightedDifference = weight - oldWeight[0];
+        if(this.expiresAfterWrite() || weightedDifference != 0)
+            this.afterWrite(new UpdateTask(node, weightedDifference));
+        else
+            this.afterRead(node, now[0], false);
+
+        if(this.hasRemovalListener() && oldValue != newValue)
+            this.notifyRemoval(nodeKey[0], prevValue[0], RemovalCause.REPLACED);
+
+        return true;
     }
 
     static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
