@@ -24,11 +24,11 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-
-import static java.util.Objects.requireNonNull;
 
 /**
  * @author liyibo
@@ -1961,6 +1961,297 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
             this.notifyRemoval(nodeKey[0], prevValue[0], RemovalCause.REPLACED);
 
         return true;
+    }
+
+    @Override
+    public void replaceAll(BiFunction<? super K, ? super V, ? extends V> function) {
+        Objects.requireNonNull(function);
+        // 为了封装一下writer.write操作
+        BiFunction<K, V, V> remappingFunction = (key, oldValue) -> {
+            V newValue = Objects.requireNonNull(function.apply(key, oldValue));
+            if(oldValue != newValue)
+                this.writer.write(key, newValue);
+            return newValue;
+        };
+        for(K key : this.keySet) {
+            long[] now = { this.expirationTicker().read() };
+            Object lookupKey = this.nodeFactory.newLookupKey(key);  // 反查出cache里面真正的key
+            this.remap(key, lookupKey, remappingFunction, now, false);
+        }
+    }
+
+    @Override
+    public V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
+                             boolean recordStats, boolean recordLoad) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(mappingFunction);
+        long now = this.expirationTicker().read();
+
+        Node<K, V> node = data.get(this.nodeFactory.newLookupKey(key));
+        if(node != null) {  // 有值了，继续检查是否真的不符合absent
+            V value = node.getValue();
+            if(value != null && !this.hasExpired(node, now)) {  // 真不符合absent，就当作read之后返回旧value
+                if(!this.isComputingAsync(node)) {
+                    this.tryExpireAfterRead(node, key, value, this.expiry(), now);
+                    this.setAccessTime(node, now);
+                }
+                this.afterRead(node, now, recordStats);
+                return value;
+            }
+        }
+        // node为null或者value为null或者node已过期，不算absent
+        if(recordStats)
+            mappingFunction = this.statsAware(mappingFunction, recordLoad);
+        Object keyRef = this.nodeFactory.newReferenceKey(key, keyReferenceQueue());
+        // 调用实际的compute方法
+        return this.doComputeIfAbsent(key, keyRef, mappingFunction, new long[] { now }, recordStats);
+    }
+
+    V doComputeIfAbsent(K key, Object keyRef, Function<? super K, ? extends V> mappingFunction,
+                        long[] now, boolean recordStats) {
+        V[] oldValue = (V[])new Object[1];
+        V[] newValue = (V[])new Object[1];
+        K[] nodeKey = (K[])new Object[1];
+        Node<K, V>[] removed = new Node[1];
+        int[] weight = new int[2]; // 旧值 + 新值
+        RemovalCause[] cause = new RemovalCause[1];
+
+        Node<K, V> node = this.data.compute(keyRef, (k, n) -> {
+            if(n == null) { // 调用function计算新value
+                newValue[0] = mappingFunction.apply(key);
+                if(newValue[0] == null)
+                    return null;
+                now[0] = this.expirationTicker().read();
+                weight[1] = this.weigher.weigh(key, newValue[0]);
+                n = this.nodeFactory.newNode(key, this.keyReferenceQueue(),
+                        newValue[0], this.valueReferenceQueue(), weight[1], now[0]);
+                this.setVariableTime(n, this.expireAfterCreate(key, newValue[0], this.expiry(), now[0]));
+                return n;   // 结束compute方法了
+            }
+
+            // node有值，走下面的compute流程
+            synchronized(n) {
+                nodeKey[0] = n.getKey();
+                weight[0] = n.getWeight();
+                oldValue[0] = n.getValue();
+                if(nodeKey[0] == null || oldValue[0] == null)
+                    cause[0] = RemovalCause.COLLECTED;
+                else if(this.hasExpired(n, now[0]))
+                    cause[0] = RemovalCause.EXPIRED;
+                else
+                    return n;   // 合法的node，只能保持旧值了，不符合absent语义
+
+                this.writer.delete(nodeKey[0], oldValue[0], cause[0]);
+                newValue[0] = mappingFunction.apply(key);   // 尝试计算
+                if(newValue[0] == null) {   // 说明mappingFunction等同于remove
+                    removed[0] = n;
+                    n.retire();
+                    return null;
+                }
+                weight[1] = this.weigher.weigh(key, newValue[0]);
+                n.setValue(newValue[0], this.valueReferenceQueue());
+                n.setWeight(weight[1]);
+
+                now[0] = this.expirationTicker().read();
+                this.setVariableTime(n, this.expireAfterCreate(key, newValue[0], this.expiry(), now[0]));
+                this.setAccessTime(n, now[0]);
+                this.setWriteTime(n, now[0]);
+                return n;
+            }
+        });
+
+        if(node == null) {  // remove
+            if(removed[0] != null)
+                this.afterWrite(new RemovalTask(removed[0]));
+            return null;
+        }
+        if(cause[0] != null) {
+            if(this.hasRemovalListener())
+                this.notifyRemoval(nodeKey[0], oldValue[0], cause[0]);
+            this.statsCounter().recordEviction(weight[0], cause[0]);
+        }
+        if(newValue[0] == null) {   // 算出来value还是null，只能返回旧值了
+            if(!this.isComputingAsync(node)) {
+                this.tryExpireAfterRead(node, key, oldValue[0], expiry(), now[0]);
+                this.setAccessTime(node, now[0]);
+            }
+            this.afterRead(node, now[0], recordStats);
+            return oldValue[0];
+        }
+        if(oldValue[0] == null && cause[0] == null) {   // 说明key是新的，就是正常的新增
+            this.afterWrite(new AddTask(node, weight[1]));
+        }else { // 否则就是update
+            int weightedDifference = (weight[1] - weight[0]);
+            this.afterWrite(new UpdateTask(node, weightedDifference));
+        }
+
+        return newValue[0];
+    }
+
+    @Override
+    public V computeIfPresent(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(remappingFunction);
+
+        Object lookupKey = this.nodeFactory.newLookupKey(key);
+        @Nullable Node<K, V> node = this.data.get(lookupKey);
+        long now;
+        if(node == null) {  // 不符合present语义
+            return null;
+        }else if (node.getValue() == null || this.hasExpired(node, (now = this.expirationTicker().read()))) {
+            // value为null、node过期，都不符合present语义
+            this.scheduleDrainBuffers();
+            return null;
+        }
+
+        BiFunction<? super K, ? super V, ? extends V> statsAwareRemappingFunction =
+                statsAware(remappingFunction, false, true, true);
+        return this.remap(key, lookupKey, statsAwareRemappingFunction,
+                new long[] { now }, false);
+    }
+
+    @Override
+    public V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction,
+                     boolean recordMiss, boolean recordLoad, boolean recordLoadFailure) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(remappingFunction);
+
+        long[] now = { this.expirationTicker().read() };
+        Object keyRef = this.nodeFactory.newReferenceKey(key, this.keyReferenceQueue());
+        BiFunction<? super K, ? super V, ? extends V> statsAwareRemappingFunction =
+                statsAware(remappingFunction, recordMiss, recordLoad, recordLoadFailure);
+        // 最后一个参数computeIfAbsent和computeIfPresent方法传的相反
+        return this.remap(key, keyRef, statsAwareRemappingFunction, now, true);
+    }
+
+    @Override
+    public V merge(K key, V value, BiFunction<? super V, ? super V, ? extends V> remappingFunction) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(value);
+        Objects.requireNonNull(remappingFunction);
+
+        long[] now = { this.expirationTicker().read() };
+        Object keyRef = this.nodeFactory.newReferenceKey(key, this.keyReferenceQueue());
+        BiFunction<? super K, ? super V, ? extends V> mergeFunction = (k, oldValue) ->
+                oldValue == null ? value : this.statsAware(remappingFunction).apply(oldValue, value);
+        return remap(key, keyRef, mergeFunction, now, true);
+    }
+
+    /**
+     * 尝试为指定的key以及对应的value，计算出新的value
+     * 很多方法最终都会复用此方法
+     */
+    V remap(K key, Object keyRef, BiFunction<? super K, ? super V, ? extends V> remappingFunction,
+            long[] now, boolean computeIfAbsent) {
+        K[] nodeKey = (K[])new Object[1];
+        V[] oldValue = (V[])new Object[1];
+        V[] newValue = (V[])new Object[1];
+        Node<K, V>[] removed = new Node[1];
+        int[] weight = new int[2]; // 旧值 + 新值
+        RemovalCause[] cause = new RemovalCause[1];
+
+        Node<K, V> node = this.data.compute(keyRef, (kr, n) -> {
+            if(n == null) {
+                if(!computeIfAbsent)    // 显式为true才可以继续，不然就直接让返回的node为null
+                    return null;
+                newValue[0] = remappingFunction.apply(key, null);   // 直接算新value
+                if(newValue[0] == null)
+                    return null;
+                now[0] = this.expirationTicker().read();
+                weight[1] = weigher.weigh(key, newValue[0]);
+                // 生成对应新的node实例
+                n = nodeFactory.newNode(keyRef, newValue[0], this.valueReferenceQueue(), weight[1], now[0]);
+                this.setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));
+                return n;   // node = 刚新建的n
+            }
+
+            // 走到这里，说明原来有旧value
+            synchronized(n) {
+                nodeKey[0] = n.getKey();
+                oldValue[0] = n.getValue();
+                if(nodeKey[0] == null || oldValue[0] == null)
+                    cause[0] = RemovalCause.COLLECTED;
+                else if(this.hasExpired(n, now[0]))
+                    cause[0] = RemovalCause.EXPIRED;
+
+                if(cause[0] != null) {
+                    this.writer.delete(nodeKey[0], oldValue[0], cause[0]);
+                    if(!computeIfAbsent) {  // 显式为false，说明允许旧value为null，不能用新node覆盖
+                        removed[0] = n;
+                        n.retire();
+                        return null;
+                    }
+                }
+
+                // 根据旧value，计算新value
+                newValue[0] = remappingFunction.apply(nodeKey[0], cause[0] == null ?oldValue[0] : null);
+                if(newValue[0] == null) {
+                    if(cause[0] == null)
+                        cause[0] = RemovalCause.EXPLICIT;
+                    removed[0] = n;
+                    n.retire();
+                    return null;
+                }
+
+                weight[0] = n.getWeight();
+                weight[1] = this.weigher.weigh(key, newValue[0]);
+                now[0] = expirationTicker().read();
+                if(cause[0] == null) {
+                    if(newValue[0] != oldValue[0])
+                        cause[0] = RemovalCause.REPLACED;
+                    this.setVariableTime(n, expireAfterUpdate(n, key, newValue[0], expiry(), now[0]));
+                }else {
+                    this.setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));
+                }
+                n.setValue(newValue[0], this.valueReferenceQueue());
+                n.setWeight(weight[1]);
+                this.setAccessTime(n, now[0]);
+                this.setWriteTime(n, now[0]);
+                return n;
+            }
+        });
+
+        // 终于生成了新的node了
+        if(cause[0] != null) {
+            if(cause[0].wasEvicted())
+                this.statsCounter().recordEviction(weight[0], cause[0]);
+            if(this.hasRemovalListener())
+                this.notifyRemoval(nodeKey[0], oldValue[0], cause[0]);
+        }
+
+        if(removed[0] != null) {
+            this.afterWrite(new RemovalTask(removed[0]));
+        }else if(node == null) {
+            // absent and not computable
+        }else if(oldValue[0] == null && cause[0] == null) { // 纯新增，没有旧值
+            this.afterWrite(new AddTask(node, weight[1]));
+        }else {
+            if(cause[0] == null) {
+                if(!this.isComputingAsync(node)) {
+                    this.tryExpireAfterRead(node, key, newValue[0], this.expiry(), now[0]);
+                    this.setAccessTime(node, now[0]);
+                }
+            }else if(cause[0] == RemovalCause.COLLECTED)
+                this.scheduleDrainBuffers();
+            this.afterRead(node, now[0], false);
+        }
+
+        return newValue[0];
+    }
+
+    @Override
+    public Set<K> keySet() {
+        return null;
+    }
+
+    @Override
+    public Collection<V> values() {
+        return null;
+    }
+
+    @Override
+    public Set<Entry<K, V>> entrySet() {
+        return null;
     }
 
     static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
