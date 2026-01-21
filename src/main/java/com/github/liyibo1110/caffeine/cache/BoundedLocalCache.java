@@ -6,14 +6,21 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
+import java.util.AbstractCollection;
 import java.util.AbstractMap;
+import java.util.AbstractSet;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Spliterator;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,8 +34,11 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import static java.util.Objects.requireNonNull;
 
 /**
  * @author liyibo
@@ -2254,6 +2264,495 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
         return null;
     }
 
+    static final class KeySetView<K, V> extends AbstractSet<K> {
+        final BoundedLocalCache<K, V> cache;
+
+        KeySetView(BoundedLocalCache<K, V> cache) {
+            this.cache = Objects.requireNonNull(cache);
+        }
+
+        @Override
+        public int size() {
+            return this.cache.size();
+        }
+
+        @Override
+        public void clear() {
+            this.cache.clear();
+        }
+
+        @Override
+        public boolean contains(Object obj) {
+            return this.cache.containsKey(obj);
+        }
+
+        @Override
+        public boolean remove(Object obj) {
+            return this.cache.remove(obj) != null;
+        }
+
+        @Override
+        public Iterator<K> iterator() {
+            return new KeyIterator<>(this.cache);
+        }
+
+        @Override
+        public Spliterator<K> spliterator() {
+            return new KeySpliterator<>(this.cache);
+        }
+
+        @Override
+        public Object[] toArray() {
+            List<Object> keys = new ArrayList<>(this.size());
+            for(Object key : this)
+                keys.add(key);
+            return keys.toArray();
+        }
+
+        @Override
+        public <T> T[] toArray(T[] array) {
+            List<Object> keys = new ArrayList<>(this.size());
+            for(Object key : this)
+                keys.add(key);
+            return keys.toArray(array);
+        }
+    }
+
+    static final class KeyIterator<K, V> implements Iterator<K> {
+        final EntryIterator<K, V> iter;
+
+        KeyIterator(BoundedLocalCache<K, V> cache) {
+            this.iter = new EntryIterator<>(cache);
+        }
+
+        @Override
+        public boolean hasNext() {
+            return this.iter.hasNext();
+        }
+
+        @Override
+        public K next() {
+            return this.iter.nextKey();
+        }
+
+        @Override
+        public void remove() {
+            this.iter.remove();
+        }
+    }
+
+    static final class KeySpliterator<K, V> implements Spliterator<K> {
+        final BoundedLocalCache<K, V> cache;
+        final Spliterator<Node<K, V>> spliterator;
+
+        KeySpliterator(BoundedLocalCache<K, V> cache, Spliterator<Node<K, V>> spliterator) {
+            this.spliterator = Objects.requireNonNull(spliterator);
+            this.cache = Objects.requireNonNull(cache);
+        }
+
+        KeySpliterator(BoundedLocalCache<K, V> cache) {
+            this(cache, cache.data.values().spliterator());
+        }
+
+        @Override
+        public void forEachRemaining(Consumer<? super K> action) {
+            Objects.requireNonNull(action);
+            // 只是个定义
+            Consumer<Node<K, V>> consumer = node -> {
+                K key = node.getKey();
+                V value = node.getValue();
+                long now = this.cache.expirationTicker().read();
+                if(key != null && value != null && node.isAlive() && !this.cache.hasExpired(node, now))
+                    action.accept(key);
+            };
+            this.spliterator.forEachRemaining(consumer);
+        }
+
+        @Override
+        public boolean tryAdvance(Consumer<? super K> action) {
+            Objects.requireNonNull(action);
+            boolean[] advanced = { false };
+            // 只是个定义
+            Consumer<Node<K, V>> consumer = node -> {
+                K key = node.getKey();
+                V value = node.getValue();
+                long now = cache.expirationTicker().read();
+                if(key != null && value != null && node.isAlive() && !this.cache.hasExpired(node, now)) {
+                    action.accept(key);
+                    advanced[0] = true;
+                }
+            };
+            while(true) {
+                if(this.spliterator.tryAdvance(consumer)) {
+                    if(advanced[0])
+                        return true;
+                    continue;
+                }
+                return false;
+            }
+        }
+
+        @Override
+        public Spliterator<K> trySplit() {
+            Spliterator<Node<K, V>> split = this.spliterator.trySplit();
+            return split == null ? null : new KeySpliterator<>(this.cache, split);
+        }
+
+        @Override
+        public long estimateSize() {
+            return this.spliterator.estimateSize();;
+        }
+
+        @Override
+        public int characteristics() {
+            return Spliterator.DISTINCT | Spliterator.CONCURRENT | Spliterator.NONNULL;;
+        }
+    }
+
+    static final class ValuesView<K, V> extends AbstractCollection<V> {
+        final BoundedLocalCache<K, V> cache;
+
+        ValuesView(BoundedLocalCache<K, V> cache) {
+            this.cache = Objects.requireNonNull(cache);
+        }
+
+        @Override
+        public int size() {
+            return this.cache.size();
+        }
+
+        @Override
+        public void clear() {
+            this.cache.clear();
+        }
+
+        @Override
+        public boolean contains(Object o) {
+            return this.cache.containsValue(o);
+        }
+
+        @Override
+        public boolean removeIf(Predicate<? super V> filter) {
+            Objects.requireNonNull(filter);
+            boolean removed = false;
+            for(Entry<K, V> entry : this.cache.entrySet()) {
+                if(filter.test(entry.getValue()))
+                    removed |= this.cache.remove(entry.getKey(), entry.getValue());
+            }
+            return removed;
+        }
+
+        @Override
+        public Iterator<V> iterator() {
+            return new ValueIterator<>(this.cache);
+        }
+
+        @Override
+        public Spliterator<V> spliterator() {
+            return new ValueSpliterator<>(this.cache);
+        }
+    }
+
+    static final class ValueIterator<K, V> implements Iterator<V> {
+        final EntryIterator<K, V> iter;
+
+        ValueIterator(BoundedLocalCache<K, V> cache) {
+            this.iter = new EntryIterator<>(cache);
+        }
+
+        @Override
+        public boolean hasNext() {
+            return this.iter.hasNext();
+        }
+
+        @Override
+        public V next() {
+            return this.iter.nextValue();
+        }
+
+        @Override
+        public void remove() {
+            this.iter.remove();
+        }
+    }
+
+    static final class ValueSpliterator<K, V> implements Spliterator<V> {
+        final BoundedLocalCache<K, V> cache;
+        final Spliterator<Node<K, V>> spliterator;
+
+        ValueSpliterator(BoundedLocalCache<K, V> cache, Spliterator<Node<K, V>> spliterator) {
+            this.spliterator = Objects.requireNonNull(spliterator);
+            this.cache = Objects.requireNonNull(cache);
+        }
+
+        ValueSpliterator(BoundedLocalCache<K, V> cache) {
+            this(cache, cache.data.values().spliterator());
+        }
+
+        @Override
+        public void forEachRemaining(Consumer<? super V> action) {
+            Objects.requireNonNull(action);
+            Consumer<Node<K, V>> consumer = node -> {
+                K key = node.getKey();
+                V value = node.getValue();
+                long now = this.cache.expirationTicker().read();
+                if(key != null && value != null && node.isAlive() && !this.cache.hasExpired(node, now))
+                    action.accept(value);
+            };
+            this.spliterator.forEachRemaining(consumer);
+        }
+
+        @Override
+        public boolean tryAdvance(Consumer<? super V> action) {
+            Objects.requireNonNull(action);
+            boolean[] advanced = { false };
+            long now = this.cache.expirationTicker().read();
+            Consumer<Node<K, V>> consumer = node -> {
+                K key = node.getKey();
+                V value = node.getValue();
+                if ((key != null) && (value != null) && !this.cache.hasExpired(node, now) && node.isAlive()) {
+                    action.accept(value);
+                    advanced[0] = true;
+                }
+            };
+            while(true) {
+                if(this.spliterator.tryAdvance(consumer)) {
+                    if(advanced[0])
+                        return true;
+                    continue;
+                }
+                return false;
+            }
+        }
+
+        @Override
+        public @Nullable Spliterator<V> trySplit() {
+            Spliterator<Node<K, V>> split = this.spliterator.trySplit();
+            return split == null ? null : new ValueSpliterator<>(this.cache, split);
+        }
+
+        @Override
+        public long estimateSize() {
+            return this.spliterator.estimateSize();
+        }
+
+        @Override
+        public int characteristics() {
+            return Spliterator.CONCURRENT | Spliterator.NONNULL;
+        }
+    }
+
+    static final class EntrySetView<K, V> extends AbstractSet<Entry<K, V>> {
+        final BoundedLocalCache<K, V> cache;
+
+        EntrySetView(BoundedLocalCache<K, V> cache) {
+            this.cache = requireNonNull(cache);
+        }
+
+        @Override
+        public int size() {
+            return this.cache.size();
+        }
+
+        @Override
+        public void clear() {
+            this.cache.clear();
+        }
+
+        @Override
+        public boolean contains(Object obj) {
+            if(!(obj instanceof Entry<?, ?>))
+                return false;
+            Entry<?, ?> entry = (Entry<?, ?>) obj;
+            Object key = entry.getKey();
+            Object value = entry.getValue();
+            if(key == null || value == null)
+                return false;
+            Node<K, V> node = this.cache.data.get(this.cache.nodeFactory.newLookupKey(key));
+            return node != null && node.containsValue(value);
+        }
+
+        @Override
+        public boolean remove(Object obj) {
+            if(!(obj instanceof Entry<?, ?>))
+                return false;
+            Entry<?, ?> entry = (Entry<?, ?>)obj;
+            return this.cache.remove(entry.getKey(), entry.getValue());
+        }
+
+        @Override
+        public boolean removeIf(Predicate<? super Entry<K, V>> filter) {
+            Objects.requireNonNull(filter);
+            boolean removed = false;
+            for(Entry<K, V> entry : this) {
+                if(filter.test(entry))
+                    removed |= this.cache.remove(entry.getKey(), entry.getValue());
+            }
+            return removed;
+        }
+
+        @Override
+        public Iterator<Entry<K, V>> iterator() {
+            return new EntryIterator<>(this.cache);
+        }
+
+        @Override
+        public Spliterator<Entry<K, V>> spliterator() {
+            return new EntrySpliterator<>(this.cache);
+        }
+    }
+
+    static final class EntryIterator<K, V> implements Iterator<Entry<K, V>> {
+        final BoundedLocalCache<K, V> cache;
+        final Iterator<Node<K, V>> iter;
+        final long now;
+
+        K key;
+        V value;
+        K removalKey;
+        Node<K, V> next;
+
+        EntryIterator(BoundedLocalCache<K, V> cache) {
+            this.cache = cache;
+            this.now = cache.expirationTicker().read();
+            this.iter = cache.data.values().iterator();
+        }
+
+        @Override
+        public boolean hasNext() {
+            if(this.next != null)
+                return true;
+            while(true) {
+                if(this.iter.hasNext()) {
+                    this.next = this.iter.next();
+                    this.key = this.next.getKey();
+                    this.value = this.next.getValue();
+
+                    // node是否已过期，即遍历过程要跳过过期的node
+                    boolean evictable = this.cache.hasExpired(this.next, this.now) || this.key == null || this.value == null;
+                    if(evictable || !this.next.isAlive()) {
+                        if(evictable)
+                            this.cache.scheduleDrainBuffers();
+                        this.value = null;
+                        this.next = null;
+                        this.key = null;
+                        continue;
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        @Override
+        public Entry<K, V> next() {
+            if(!this.hasNext())
+                throw new NoSuchElementException();
+            Entry<K, V> entry = new WriteThroughEntry<>(this.cache, this.key, this.value);
+            this.removalKey = this.key;
+            this.value = null;
+            this.next = null;
+            this.key = null;
+            return entry;
+        }
+
+        @Override
+        public void remove() {
+            if(this.removalKey == null)
+                throw new IllegalStateException();
+            this.cache.remove(this.removalKey);
+            this.removalKey = null;
+        }
+
+        K nextKey() {
+            if(!this.hasNext())
+                throw new NoSuchElementException();
+            this.removalKey = this.key;
+            this.value = null;
+            this.next = null;
+            this.key = null;
+            return this.removalKey;
+        }
+
+        V nextValue() {
+            if(!this.hasNext())
+                throw new NoSuchElementException();
+            this.removalKey = this.key;
+            V val = this.value;
+            this.value = null;
+            this.next = null;
+            this.key = null;
+            return val;
+        }
+    }
+
+    static final class EntrySpliterator<K, V> implements Spliterator<Entry<K, V>> {
+        final BoundedLocalCache<K, V> cache;
+        final Spliterator<Node<K, V>> spliterator;
+
+        EntrySpliterator(BoundedLocalCache<K, V> cache, Spliterator<Node<K, V>> spliterator) {
+            this.spliterator = Objects.requireNonNull(spliterator);
+            this.cache = Objects.requireNonNull(cache);
+        }
+
+        EntrySpliterator(BoundedLocalCache<K, V> cache) {
+            this(cache, cache.data.values().spliterator());
+        }
+
+        @Override
+        public void forEachRemaining(Consumer<? super Entry<K, V>> action) {
+            Objects.requireNonNull(action);
+            Consumer<Node<K, V>> consumer = node -> {
+                K key = node.getKey();
+                V value = node.getValue();
+                long now = this.cache.expirationTicker().read();
+                if ((key != null) && (value != null) && node.isAlive() && !this.cache.hasExpired(node, now)) {
+                    action.accept(new WriteThroughEntry<>(this.cache, key, value));
+                }
+            };
+            this.spliterator.forEachRemaining(consumer);
+        }
+
+        @Override
+        public boolean tryAdvance(Consumer<? super Entry<K, V>> action) {
+            Objects.requireNonNull(action);
+            boolean[] advanced = { false };
+            Consumer<Node<K, V>> consumer = node -> {
+                K key = node.getKey();
+                V value = node.getValue();
+                long now = this.cache.expirationTicker().read();
+                if ((key != null) && (value != null) && node.isAlive() && !this.cache.hasExpired(node, now)) {
+                    action.accept(new WriteThroughEntry<>(this.cache, key, value));
+                    advanced[0] = true;
+                }
+            };
+            while(true) {
+                if(this.spliterator.tryAdvance(consumer)) {
+                    if(advanced[0])
+                        return true;
+                    continue;
+                }
+                return false;
+            }
+        }
+
+        @Override
+        public @Nullable Spliterator<Entry<K, V>> trySplit() {
+            Spliterator<Node<K, V>> split = this.spliterator.trySplit();
+            return split == null ? null : new EntrySpliterator<>(this.cache, split);
+        }
+
+        @Override
+        public long estimateSize() {
+            return this.spliterator.estimateSize();
+        }
+
+        @Override
+        public int characteristics() {
+            return Spliterator.DISTINCT | Spliterator.CONCURRENT | Spliterator.NONNULL;
+        }
+    }
+
     static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
         private static final long serialVersionUID = 1L;
 
@@ -2298,6 +2797,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
         public boolean cancel(boolean mayInterruptIfRunning) {
             return false;
         }
+    }
+
+    /**
+     * 将cache配置序列化
+     */
+    static <K, V> SerializationProxy<K, V> makeSerializationProxy(BoundedLocalCache<?, ?> cache, boolean isWeighted) {
+
     }
 }
 
