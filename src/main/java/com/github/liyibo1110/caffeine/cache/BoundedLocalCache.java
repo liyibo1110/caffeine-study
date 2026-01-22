@@ -1,8 +1,12 @@
 package com.github.liyibo1110.caffeine.cache;
 
 import com.github.liyibo1110.caffeine.cache.stats.StatsCounter;
+import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
+import java.io.InvalidObjectException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
@@ -12,6 +16,7 @@ import java.util.AbstractSet;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -19,11 +24,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.Spliterator;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
@@ -35,6 +44,7 @@ import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -2251,17 +2261,124 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
 
     @Override
     public Set<K> keySet() {
-        return null;
+        final Set<K> ks = this.keySet;
+        return ks == null ? this.keySet = new KeySetView<>(this) : ks;
     }
 
     @Override
     public Collection<V> values() {
-        return null;
+        final Collection<V> vs = this.values;
+        return vs == null ? this.values = new ValuesView<>(this) : vs;
     }
 
     @Override
     public Set<Entry<K, V>> entrySet() {
-        return null;
+        final Set<Entry<K, V>> es = this.entrySet;
+        return es == null ? this.entrySet = new EntrySetView<>(this) : es;
+    }
+
+    /**
+     * 返回最热/最冷的limit个Node
+     */
+    Map<K, V> evictionOrder(int limit, Function<V, V> transformer, boolean hottest) {
+        Supplier<Iterator<Node<K, V>>> iteratorSupplier = () -> {
+            // 定义排序器（按照流行度里存的频率）
+            Comparator<Node<K, V>> comparator = Comparator.comparingInt(node -> {
+                K key = node.getKey();
+                return key == null ? 0 : frequencySketch().frequency(key);
+            });
+            if(hottest) {
+                var secondary = LinkedDeque.PeekingIterator.comparing(
+                        this.accessOrderProbationDeque().descendingIterator(),
+                        this.accessOrderWindowDeque().descendingIterator(), comparator);
+                return LinkedDeque.PeekingIterator.concat(this.accessOrderProtectedDeque().descendingIterator(), secondary);
+            }else {
+                var primary = LinkedDeque.PeekingIterator.comparing(
+                        this.accessOrderWindowDeque().iterator(),
+                        this.accessOrderProbationDeque().iterator(), comparator.reversed());
+                return LinkedDeque.PeekingIterator.concat(primary, this.accessOrderProtectedDeque().iterator());
+            }
+        };
+        return this.fixedSnapshot(iteratorSupplier, limit, transformer);
+    }
+
+    /**
+     * 返回最年轻/最老（access时间）的limit个Node
+     */
+    Map<K, V> expireAfterAccessOrder(int limit, Function<V, V> transformer, boolean oldest) {
+        if(!this.evicts()) {
+            // 没有开启清理功能，则直接走里面的逻辑
+            Supplier<Iterator<Node<K, V>>> iteratorSupplier = () -> oldest
+                    ? this.accessOrderWindowDeque().iterator()
+                    : this.accessOrderWindowDeque().descendingIterator();
+            return this.fixedSnapshot(iteratorSupplier, limit, transformer);
+        }
+
+        // 开启了清理，则走下面的流程
+        Supplier<Iterator<Node<K, V>>> iteratorSupplier = () -> {
+            Comparator<Node<K, V>> comparator = Comparator.comparingLong(Node::getAccessTime);
+            LinkedDeque.PeekingIterator<Node<K, V>> first, second, third;
+            if(oldest) {
+                first = this.accessOrderWindowDeque().iterator();
+                second = this.accessOrderProbationDeque().iterator();
+                third = this.accessOrderProtectedDeque().iterator();
+            }else {
+                comparator = comparator.reversed();
+                first = this.accessOrderWindowDeque().descendingIterator();
+                second = this.accessOrderProbationDeque().descendingIterator();
+                third = this.accessOrderProtectedDeque().descendingIterator();
+            }
+            return LinkedDeque.PeekingIterator.comparing(
+                    LinkedDeque.PeekingIterator.comparing(first, second, comparator), third, comparator);
+        };
+        return this.fixedSnapshot(iteratorSupplier, limit, transformer);
+    }
+
+    /**
+     * 返回最年轻/最老（write时间）的limit个Node
+     */
+    Map<K, V> expireAfterWriteOrder(int limit, Function<V, V> transformer, boolean oldest) {
+        Supplier<Iterator<Node<K, V>>> iteratorSupplier = () -> oldest
+                ? this.writeOrderDeque().iterator()
+                : this.writeOrderDeque().descendingIterator();
+        return this.fixedSnapshot(iteratorSupplier, limit, transformer);
+    }
+
+    /**
+     * 返回一个由给定的迭代器排序的只读快照映射
+     */
+    Map<K, V> fixedSnapshot(Supplier<Iterator<Node<K, V>>> iteratorSupplier, int limit, Function<V, V> transformer) {
+        Caffeine.requireArgument(limit >= 0);
+        this.evictionLock.lock();
+        try {
+            this.maintenance(null); // 强制清理一次
+            int initialCapacity = Math.min(limit, size());
+            Iterator<Node<K, V>> iter = iteratorSupplier.get();
+            Map<K, V> map = new LinkedHashMap<>(initialCapacity);
+            while(map.size() < limit && iter.hasNext()) {
+                Node<K, V> node = iter.next();
+                K key = node.getKey();
+                V value = transformer.apply(node.getValue());
+                if(key != null && value != null && node.isAlive())
+                    map.put(key, value);
+            }
+            return Collections.unmodifiableMap(map);
+        } finally {
+            this.evictionLock.unlock();
+        }
+    }
+
+    /**
+     * 返回一个由到variable到期顺序的只读快照映射
+     */
+    Map<K, V> variableSnapshot(boolean ascending, int limit, Function<V, V> transformer) {
+        this.evictionLock.lock();
+        try {
+            this.maintenance(null);
+            return this.timerWheel().snapshot(ascending, limit, transformer);
+        } finally {
+            this.evictionLock.unlock();
+        }
     }
 
     static final class KeySetView<K, V> extends AbstractSet<K> {
@@ -2803,7 +2920,603 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V> im
      * 将cache配置序列化
      */
     static <K, V> SerializationProxy<K, V> makeSerializationProxy(BoundedLocalCache<?, ?> cache, boolean isWeighted) {
+        SerializationProxy<K, V> proxy = new SerializationProxy<>();
+        proxy.weakKeys = cache.collectKeys();
+        proxy.weakValues = cache.nodeFactory.weakValues();
+        proxy.softValues = cache.nodeFactory.softValues();
+        proxy.isRecordingStats = cache.isRecordingStats();
+        proxy.removalListener = cache.removalListener();
+        proxy.ticker = cache.expirationTicker();
+        proxy.writer = cache.writer;
+        if(cache.expiresAfterAccess())
+            proxy.expiresAfterAccessNanos = cache.expiresAfterAccessNanos();
+        if(cache.expiresAfterWrite())
+            proxy.expiresAfterWriteNanos = cache.expiresAfterWriteNanos();
+        if(cache.expiresVariable())
+            proxy.expiry = cache.expiry();
+        if(cache.evicts()) {
+            if(isWeighted) {
+                proxy.weigher = cache.weigher;
+                proxy.maximumWeight = cache.maximum();
+            } else {
+                proxy.maximumSize = cache.maximum();
+            }
+        }
+        return proxy;
+    }
 
+    /* --------------- Manual Cache同步相关实现 --------------- */
+
+    static class BoundedLocalManualCache<K, V> implements LocalManualCache<K, V>, Serializable {
+        private static final long serialVersionUID = 1;
+
+        final BoundedLocalCache<K, V> cache;
+        final boolean isWeighted;
+        Policy<K, V> policy;
+
+        BoundedLocalManualCache(Caffeine<K, V> builder) {
+            this(builder, null);
+        }
+
+        BoundedLocalManualCache(Caffeine<K, V> builder, CacheLoader<? super K, V> loader) {
+            this.cache = LocalCacheFactory.newBoundedLocalCache(builder, loader, false);
+            this.isWeighted = builder.isWeighted();
+        }
+
+        @Override
+        public BoundedLocalCache<K, V> cache() {
+            return this.cache;
+        }
+
+        @Override
+        public Policy<K, V> policy() {
+            return this.policy == null
+                    ? this.policy = new BoundedPolicy<>(this.cache, Function.identity(), this.isWeighted)
+                    : this.policy;
+        }
+
+        private void readObject(ObjectInputStream stream) throws InvalidObjectException {
+            throw new InvalidObjectException("Proxy required");
+        }
+
+        Object writeReplace() {
+            return makeSerializationProxy(cache, isWeighted);
+        }
+
+    }
+
+    static final class BoundedPolicy<K, V> implements Policy<K, V> {
+        final BoundedLocalCache<K, V> cache;
+        final Function<V, V> transformer;
+        final boolean isWeighted;
+
+        Optional<Eviction<K, V>> eviction;
+        Optional<Expiration<K, V>> refreshes;
+        Optional<Expiration<K, V>> afterWrite;
+        Optional<Expiration<K, V>> afterAccess;
+        Optional<VarExpiration<K, V>> variable;
+
+        BoundedPolicy(BoundedLocalCache<K, V> cache, Function<V, V> transformer, boolean isWeighted) {
+            this.transformer = transformer;
+            this.isWeighted = isWeighted;
+            this.cache = cache;
+        }
+
+        @Override
+        public boolean isRecordingStats() {
+            return this.cache.isRecordingStats();
+        }
+
+        @Override
+        public V getIfPresentQuietly(Object key) {
+            Node<K, V> node = this.cache.data.get(this.cache.nodeFactory.newLookupKey(key));
+            if(node == null || this.cache.hasExpired(node, this.cache.expirationTicker().read()))
+                return null;
+            return this.transformer.apply(node.getValue());
+        }
+
+        @Override
+        public Optional<Eviction<K, V>> eviction() {
+            return this.cache.evicts()
+                    ? this.eviction == null ? this.eviction = Optional.of(new BoundedEviction()) : this.eviction;
+        }
+
+        @Override
+        public Optional<Expiration<K, V>> expireAfterAccess() {
+            if(!this.cache.expiresAfterAccess())
+                return Optional.empty();
+            return this.afterAccess == null
+                    ? this.afterAccess = Optional.of(new BoundedExpireAfterAccess())
+                    : this.afterAccess;
+        }
+
+        @Override
+        public Optional<Expiration<K, V>> expireAfterWrite() {
+            if(!this.cache.expiresAfterWrite())
+                return Optional.empty();
+            return this.afterWrite == null
+                    ? this.afterWrite = Optional.of(new BoundedExpireAfterWrite())
+                    : this.afterWrite;
+        }
+
+        @Override
+        public Optional<VarExpiration<K, V>> expireVariably() {
+            if(!cache.expiresVariable())
+                return Optional.empty();
+            return this.variable == null
+                    ? this.variable = Optional.of(new BoundedVarExpiration())
+                    : this.variable;
+        }
+
+        @Override
+        public Optional<Expiration<K, V>> refreshAfterWrite() {
+            if(!cache.refreshAfterWrite())
+                return Optional.empty();
+            return this.refreshes == null
+                    ? this.refreshes = Optional.of(new BoundedRefreshAfterWrite())
+                    : this.refreshes;
+        }
+
+        final class BoundedEviction implements Eviction<K, V> {
+            @Override
+            public boolean isWeighted() {
+                return isWeighted;
+            }
+
+            @Override
+            public OptionalInt weightOf(K key) {
+                Objects.requireNonNull(key);
+                if(!isWeighted)
+                    return OptionalInt.empty();
+                Node<K, V> node = cache.data.get(cache.nodeFactory.newLookupKey(key));
+                if(node == null)
+                    return OptionalInt.empty();
+                synchronized (node) {
+                    return OptionalInt.of(node.getWeight());
+                }
+            }
+
+            @Override
+            public OptionalLong weightedSize() {
+                if(cache.evicts() && this.isWeighted()) {
+                    cache.evictionLock.lock();
+                    try {
+                        return OptionalLong.of(Math.max(0, cache.weightedSize()));
+                    } finally {
+                        cache.evictionLock.unlock();
+                    }
+                }
+                return OptionalLong.empty();
+            }
+
+            @Override
+            public long getMaximum() {
+                cache.evictionLock.lock();
+                try {
+                    return cache.maximum();
+                } finally {
+                    cache.evictionLock.unlock();
+                }
+            }
+
+            @Override
+            public void setMaximum(long maximum) {
+                cache.evictionLock.lock();
+                try {
+                    cache.setMaximumSize(maximum);
+                    cache.maintenance(null);
+                } finally {
+                    cache.evictionLock.unlock();
+                }
+            }
+
+            @Override
+            public Map<K, V> coldest(int limit) {
+                return cache.evictionOrder(limit, transformer, false);
+            }
+
+            @Override
+            public Map<K, V> hottest(int limit) {
+                return cache.evictionOrder(limit, transformer, true);
+            }
+        }
+
+        final class BoundedExpireAfterAccess implements Expiration<K, V> {
+            @Override
+            public OptionalLong ageOf(K key, TimeUnit unit) {
+                Objects.requireNonNull(key);
+                Objects.requireNonNull(unit);
+                Object lookupKey = cache.nodeFactory.newLookupKey(key);
+                Node<?, ?> node = cache.data.get(lookupKey);
+                if(node == null)
+                    return OptionalLong.empty();
+                long age = cache.expirationTicker().read() - node.getAccessTime();
+                return age > cache.expiresAfterAccessNanos()
+                        ? OptionalLong.empty()
+                        : OptionalLong.of(unit.convert(age, TimeUnit.NANOSECONDS));
+            }
+
+            @Override
+            public long getExpiresAfter(TimeUnit unit) {
+                return unit.convert(cache.expiresAfterAccessNanos(), TimeUnit.NANOSECONDS);
+            }
+
+            @Override
+            public void setExpiresAfter(long duration, TimeUnit unit) {
+                Caffeine.requireArgument(duration >= 0);
+                cache.setExpiresAfterAccessNanos(unit.toNanos(duration));
+                cache.scheduleAfterWrite();
+            }
+
+            @Override
+            public Map<K, V> oldest(int limit) {
+                return cache.expireAfterAccessOrder(limit, transformer, true);
+            }
+
+            @Override
+            public Map<K, V> youngest(int limit) {
+                return cache.expireAfterAccessOrder(limit, transformer, false);
+            }
+        }
+
+        final class BoundedExpireAfterWrite implements Expiration<K, V> {
+            @Override
+            public OptionalLong ageOf(K key, TimeUnit unit) {
+                Objects.requireNonNull(key);
+                Objects.requireNonNull(unit);
+                Object lookupKey = cache.nodeFactory.newLookupKey(key);
+                Node<?, ?> node = cache.data.get(lookupKey);
+                if(node == null)
+                    return OptionalLong.empty();
+                long age = cache.expirationTicker().read() - node.getWriteTime();
+                return age > cache.expiresAfterWriteNanos()
+                        ? OptionalLong.empty()
+                        : OptionalLong.of(unit.convert(age, TimeUnit.NANOSECONDS));
+            }
+
+            @Override
+            public long getExpiresAfter(TimeUnit unit) {
+                return unit.convert(cache.expiresAfterWriteNanos(), TimeUnit.NANOSECONDS);
+            }
+
+            @Override
+            public void setExpiresAfter(long duration, TimeUnit unit) {
+                Caffeine.requireArgument(duration >= 0);
+                cache.setExpiresAfterWriteNanos(unit.toNanos(duration));
+                cache.scheduleAfterWrite();
+            }
+
+            @Override
+            public Map<K, V> oldest(int limit) {
+                return cache.expireAfterWriteOrder(limit, transformer, true);
+            }
+
+            @Override
+            public Map<K, V> youngest(int limit) {
+                return cache.expireAfterWriteOrder(limit, transformer, false);
+            }
+        }
+
+        final class BoundedVarExpiration implements VarExpiration<K, V> {
+            @Override
+            public OptionalLong getExpiresAfter(K key, TimeUnit unit) {
+                Objects.requireNonNull(key);
+                Objects.requireNonNull(unit);
+                Object lookupKey = cache.nodeFactory.newLookupKey(key);
+                Node<?, ?> node = cache.data.get(lookupKey);
+                if(node == null)
+                    return OptionalLong.empty();
+                long duration = node.getVariableTime() - cache.expirationTicker().read();
+                return duration <= 0
+                        ? OptionalLong.empty()
+                        : OptionalLong.of(unit.convert(duration, TimeUnit.NANOSECONDS));
+            }
+
+            @Override
+            public void setExpiresAfter(K key, long duration, TimeUnit unit) {
+                Objects.requireNonNull(key);
+                Objects.requireNonNull(unit);
+                Caffeine.requireArgument(duration >= 0);
+                Object lookupKey = cache.nodeFactory.newLookupKey(key);
+                Node<K, V> node = cache.data.get(lookupKey);
+                if(node != null) {
+                    long now;
+                    long durationNanos = TimeUnit.NANOSECONDS.convert(duration, unit);
+                    synchronized(node) {
+                        now = cache.expirationTicker().read();
+                        node.setVariableTime(now + Math.min(durationNanos, MAXIMUM_EXPIRY));
+                    }
+                    cache.afterRead(node, now, false);
+                }
+            }
+
+            @Override
+            public void put(K key, V value, long duration, TimeUnit unit) {
+                this.put(key, value, duration, unit, false);
+            }
+
+            @Override
+            public boolean putIfAbsent(K key, V value, long duration, TimeUnit unit) {
+                V previous = this.put(key, value, duration, unit, true);
+                return previous == null;
+            }
+
+            /**
+             * 直接给定了存活时间的特殊put入口，将直接使用这个时间来构造Expire实现（即不用key和value来计算了）
+             */
+            V put(K key, V value, long duration, TimeUnit unit, boolean onlyIfAbsent) {
+                Objects.requireNonNull(unit);
+                Objects.requireNonNull(value);
+                Caffeine.requireArgument(duration >= 0);
+                Expiry<K, V> expiry = new Expiry<>() {
+                    @Override
+                    public long expireAfterCreate(K key, V value, long currentTime) {
+                        return unit.toNanos(duration);
+                    }
+
+                    @Override
+                    public long expireAfterUpdate(K key, V value, long currentTime, long currentDuration) {
+                        return unit.toNanos(duration);
+                    }
+
+                    @Override
+                    public long expireAfterRead(K key, V value, long currentTime, long currentDuration) {
+                        return currentDuration;
+                    }
+                };
+                if(cache.isAsync) {
+                    Expiry<K, V> asyncExpiry = (Expiry<K, V>)new Async.AsyncExpiry<>(expiry);
+                    expiry = asyncExpiry;
+                    V asyncValue = (V)CompletableFuture.completedFuture(value);
+                    value = asyncValue;
+                }
+                return cache.put(key, value, expiry, true, onlyIfAbsent);
+            }
+
+            @Override
+            public Map<K, V> oldest(int limit) {
+                return cache.variableSnapshot(true, limit, transformer);
+            }
+
+            @Override
+            public Map<K, V> youngest(int limit) {
+                return cache.variableSnapshot(false, limit, transformer);
+            }
+        }
+
+        final class BoundedRefreshAfterWrite implements Expiration<K, V> {
+            @Override
+            public OptionalLong ageOf(K key, TimeUnit unit) {
+                Objects.requireNonNull(key);
+                Objects.requireNonNull(unit);
+                Object lookupKey = cache.nodeFactory.newLookupKey(key);
+                Node<?, ?> node = cache.data.get(lookupKey);
+                if(node == null)
+                    return OptionalLong.empty();
+                long age = cache.expirationTicker().read() - node.getWriteTime();
+                return age > cache.refreshAfterWriteNanos()
+                        ? OptionalLong.empty()
+                        : OptionalLong.of(unit.convert(age, TimeUnit.NANOSECONDS));
+            }
+
+            @Override
+            public long getExpiresAfter(TimeUnit unit) {
+                return unit.convert(cache.refreshAfterWriteNanos(), TimeUnit.NANOSECONDS);
+            }
+
+            @Override
+            public void setExpiresAfter(long duration, TimeUnit unit) {
+                Caffeine.requireArgument(duration >= 0);
+                cache.setRefreshAfterWriteNanos(unit.toNanos(duration));
+                cache.scheduleAfterWrite();
+            }
+
+            @Override
+            public Map<K, V> oldest(int limit) {
+                return cache.expiresAfterWrite()
+                        ? expireAfterWrite().get().oldest(limit)
+                        : sortedByWriteTime(limit, true);
+            }
+
+            @Override
+            public Map<K, V> youngest(int limit) {
+                return cache.expiresAfterWrite()
+                        ? expireAfterWrite().get().youngest(limit)
+                        : sortedByWriteTime(limit, false);
+            }
+
+            /**
+             * 保底算法，如果cache没有开启write过期，则只能遍历cache本身查看node的writeTime来返回了
+             */
+            Map<K, V> sortedByWriteTime(int limit, boolean ascending) {
+                Comparator<Node<K, V>> comparator = Comparator.comparingLong(Node::getWriteTime);
+                var iter = cache.data.values().stream().parallel().sorted(
+                        ascending ? comparator : comparator.reversed()).limit(limit).iterator();
+                return cache.fixedSnapshot(() -> iter, limit, transformer);
+            }
+        }
+    }
+
+    /* --------------- Loading Cache同步相关实现 --------------- */
+
+    static final class BoundedLocalLoadingCache<K, V> extends BoundedLocalManualCache<K, V>
+        implements LocalLoadingCache<K, V> {
+        private static final long serialVersionUID = 1;
+
+        final Function<K, V> mappingFunction;
+        final Function<Iterable<? extends K>, Map<K, V>> bulkMappingFunction;
+
+        BoundedLocalLoadingCache(Caffeine<K, V> builder, CacheLoader<? super K, V> loader) {
+            super(builder, loader);
+            Objects.requireNonNull(loader);
+            this.mappingFunction = LocalLoadingCache.newMappingFunction(loader);
+            this.bulkMappingFunction = LocalLoadingCache.newBulkMappingFunction(loader);
+        }
+
+        @Override
+        public CacheLoader<? super K, V> cacheLoader() {
+            return cache.cacheLoader;
+        }
+
+        @Override
+        public Function<K, V> mappingFunction() {
+            return mappingFunction;
+        }
+
+        @Override
+        public @Nullable Function<Iterable<? extends K>, Map<K, V>> bulkMappingFunction() {
+            return bulkMappingFunction;
+        }
+
+        private void readObject(ObjectInputStream stream) throws InvalidObjectException {
+            throw new InvalidObjectException("Proxy required");
+        }
+
+        @Override
+        Object writeReplace() {
+            SerializationProxy<K, V> proxy = (SerializationProxy<K, V>)super.writeReplace();
+            if(cache.refreshAfterWrite())
+                proxy.refreshAfterWriteNanos = cache.refreshAfterWriteNanos();
+            proxy.loader = cache.cacheLoader;
+            return proxy;
+        }
+    }
+
+    /* --------------- Async Cache异步相关实现 --------------- */
+
+    static final class BoundedLocalAsyncCache<K, V> implements LocalAsyncCache<K, V>, Serializable {
+        private static final long serialVersionUID = 1;
+
+        final BoundedLocalCache<K, CompletableFuture<V>> cache;
+        final boolean isWeighted;
+
+        ConcurrentMap<K, CompletableFuture<V>> mapView;
+        CacheView<K, V> cacheView;
+        Policy<K, V> policy;
+
+        BoundedLocalAsyncCache(Caffeine<K, V> builder) {
+            this.cache = (BoundedLocalCache<K, CompletableFuture<V>>)LocalCacheFactory
+                    .newBoundedLocalCache(builder, null, true);
+            this.isWeighted = builder.isWeighted();
+        }
+
+        @Override
+        public BoundedLocalCache<K, CompletableFuture<V>> cache() {
+            return this.cache;
+        }
+
+        @Override
+        public ConcurrentMap<K, CompletableFuture<V>> asMap() {
+            return this.mapView == null ? this.mapView = new AsyncAsMapView<>(this) : this.mapView;
+        }
+
+        @Override
+        public Cache<K, V> synchronous() {
+            return this.cacheView == null ? this.cacheView = new CacheView<>(this) : this.cacheView;
+        }
+
+        @Override
+        public Policy<K, V> policy() {
+            if(this.policy == null) {
+                BoundedLocalCache<K, V> castCache = (BoundedLocalCache<K, V>)this.cache;
+                Function<CompletableFuture<V>, V> transformer = Async::getIfReady;
+                Function<V, V> castTransformer = (Function<V, V>)transformer;
+                this.policy = new BoundedPolicy<>(castCache, castTransformer, this.isWeighted);
+            }
+            return this.policy;
+        }
+
+        private void readObject(ObjectInputStream stream) throws InvalidObjectException {
+            throw new InvalidObjectException("Proxy required");
+        }
+
+        Object writeReplace() {
+            SerializationProxy<K, V> proxy = makeSerializationProxy(this.cache, this.isWeighted);
+            if(this.cache.refreshAfterWrite())
+                proxy.refreshAfterWriteNanos = this.cache.refreshAfterWriteNanos();
+            proxy.async = true;
+            return proxy;
+        }
+    }
+
+    /* --------------- Async Loading Cache异步相关实现 --------------- */
+
+    static final class BoundedLocalAsyncLoadingCache<K, V> extends LocalAsyncLoadingCache<K, V> implements Serializable {
+        private static final long serialVersionUID = 1;
+
+        final BoundedLocalCache<K, CompletableFuture<V>> cache;
+        final boolean isWeighted;
+
+        ConcurrentMap<K, CompletableFuture<V>> mapView;
+        Policy<K, V> policy;
+
+        BoundedLocalAsyncLoadingCache(Caffeine<K, V> builder, AsyncCacheLoader<? super K, V> loader) {
+            super(loader);
+            this.isWeighted = builder.isWeighted();
+            this.cache = (BoundedLocalCache<K, CompletableFuture<V>>)LocalCacheFactory
+                    .newBoundedLocalCache(builder, new AsyncLoader<>(loader, builder), true);
+        }
+
+        @Override
+        public BoundedLocalCache<K, CompletableFuture<V>> cache() {
+            return this.cache;
+        }
+
+        @Override
+        public ConcurrentMap<K, CompletableFuture<V>> asMap() {
+            return this.mapView == null ? this.mapView = new AsyncAsMapView<>(this) : this.mapView;
+        }
+
+        @Override
+        public Policy<K, V> policy() {
+            if(policy == null) {
+                BoundedLocalCache<K, V> castCache = (BoundedLocalCache<K, V>)this.cache;
+                Function<CompletableFuture<V>, V> transformer = Async::getIfReady;
+                Function<V, V> castTransformer = (Function<V, V>)transformer;
+                this.policy = new BoundedPolicy<>(castCache, castTransformer, this.isWeighted);
+            }
+            return this.policy;
+        }
+
+        private void readObject(ObjectInputStream stream) throws InvalidObjectException {
+            throw new InvalidObjectException("Proxy required");
+        }
+
+        Object writeReplace() {
+            SerializationProxy<K, V> proxy = makeSerializationProxy(this.cache, this.isWeighted);
+            if(this.cache.refreshAfterWrite())
+                proxy.refreshAfterWriteNanos = this.cache.refreshAfterWriteNanos();
+            proxy.loader = this.loader;
+            proxy.async = true;
+            return proxy;
+        }
+
+        static final class AsyncLoader<K, V> implements CacheLoader<K, V> {
+            final AsyncCacheLoader<? super K, V> loader;
+            final Executor executor;
+
+            AsyncLoader(AsyncCacheLoader<? super K, V> loader, Caffeine<?, ?> builder) {
+                this.loader = Objects.requireNonNull(loader);
+                this.executor = Objects.requireNonNull(builder.getExecutor());
+            }
+
+            @Override
+            public V load(K key) {
+                V newValue = (V)this.loader.asyncLoad(key, this.executor);
+                return newValue;
+            }
+
+            @Override
+            public V reload(K key, V oldValue) {
+                V newValue = (V)this.loader.asyncReload(key, oldValue, this.executor);
+                return newValue;
+            }
+
+            @Override
+            public CompletableFuture<V> asyncReload(K key, V oldValue, Executor executor) {
+                return this.loader.asyncReload(key, oldValue, executor);
+            }
+        }
     }
 }
 
