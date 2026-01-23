@@ -448,13 +448,56 @@ public final class Caffeine<K, V> {
     }
 
 
-    /* 还剩最终的各种build方法了 */
+    /* 各种build方法 */
 
+    public <K1 extends K, V1 extends V> Cache<K1, V1> build() {
+        this.requireWeightWithWeigher();
+        this.requireNonLoadingCache();
 
+        Caffeine<K1, V1> self = (Caffeine<K1, V1>)this;
+        return this.isBounded()
+                ? new BoundedLocalCache.BoundedLocalManualCache<>(self)
+                : new UnboundedLocalCache.UnboundedLocalManualCache<>(self);
+    }
 
+    public <K1 extends K, V1 extends V> LoadingCache<K1, V1> build(CacheLoader<? super K1, V1> loader) {
+        this.requireWeightWithWeigher();
 
+        Caffeine<K1, V1> self = (Caffeine<K1, V1>)this;
+        return this.isBounded() || this.refreshAfterWrite()
+                ? new BoundedLocalCache.BoundedLocalLoadingCache<>(self, loader)
+                : new UnboundedLocalCache.UnboundedLocalLoadingCache<>(self, loader);
+    }
 
+    public <K1 extends K, V1 extends V> AsyncCache<K1, V1> buildAsync() {
+        requireState(this.valueStrength == null, "Weak or soft values can not be combined with AsyncCache");
+        requireState(this.writer == null, "CacheWriter can not be combined with AsyncCache");
+        requireState(isStrongKeys() || this.evictionListener == null, "Weak keys cannot be combined eviction listener and with AsyncLoadingCache");
+        this.requireWeightWithWeigher();
+        this.requireNonLoadingCache();
 
+        Caffeine<K1, V1> self = (Caffeine<K1, V1>)this;
+        return this.isBounded()
+                ? new BoundedLocalCache.BoundedLocalAsyncCache<>(self)
+                : new UnboundedLocalCache.UnboundedLocalAsyncCache<>(self);
+    }
+
+    public <K1 extends K, V1 extends V> AsyncLoadingCache<K1, V1> buildAsync(CacheLoader<? super K1, V1> loader) {
+        return this.buildAsync((AsyncCacheLoader<? super K1, V1>)loader);
+    }
+
+    public <K1 extends K, V1 extends V> AsyncLoadingCache<K1, V1> buildAsync(AsyncCacheLoader<? super K1, V1> loader) {
+        requireState(isStrongValues(),"Weak or soft values cannot be combined with AsyncLoadingCache");
+        requireState(this.writer == null, "CacheWriter cannot be combined with AsyncLoadingCache");
+        requireState(isStrongKeys() || this.evictionListener == null, "Weak keys cannot be combined eviction listener and with AsyncLoadingCache");
+        this.requireWeightWithWeigher();
+        Objects.requireNonNull(loader);
+
+        Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
+        return isBounded() || refreshAfterWrite()
+                ? new BoundedLocalCache.BoundedLocalAsyncLoadingCache<>(self, loader)
+                : new UnboundedLocalCache.UnboundedLocalAsyncLoadingCache<>(self, loader);
+    }
 
     void requireNonLoadingCache() {
         this.requireState(this.refreshAfterWriteNanos == UNSET_INT, "refreshAfterWrite requires a LoadingCache");
